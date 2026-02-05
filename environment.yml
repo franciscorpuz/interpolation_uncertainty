@@ -1,0 +1,11 @@
+name: interpolation_uncertainty
+name: interpolation_uncertainty
+channels:
+  - defaults
+dependencies:
+  - build
+  - gdal=3.11
+  - jupyterlab
+  - matplotlib
+  - scipy
+prefix: C:\ProgramData\miniconda3\envs\interpolation_uncertainty
