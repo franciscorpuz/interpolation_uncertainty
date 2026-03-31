@@ -1,5 +1,4 @@
 name: interpolation_uncertainty
-name: interpolation_uncertainty
 channels:
   - defaults
 dependencies:
