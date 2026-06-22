@@ -13,7 +13,8 @@ dependencies = [
     "gdal<3.12",
     "matplotlib",
     "jupyterlab",
-    "scipy"
+    "scipy",
+    "libgdal-hdf5"
 ]
 authors = [
   {name = "Francis Corpuz", email = "francis.corpuz@noaa.gov"},

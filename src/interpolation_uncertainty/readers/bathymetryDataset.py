@@ -1,4 +1,4 @@
-from typing import Dict
+from typing import Dict, Union
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -63,6 +63,22 @@ class BathymetryDataset(np.ndarray):
                 f"\nfilename='{self.filename}', "
                 f"\nfiletype='{self.filetype}, "
                 f"\nmetadata='{self.metadata}')")
+    
+    def show_depth(self, title: Union[str, None] = None):
+        """
+        Plots the depth for visualization
+        Parameters
+        ----------
+        title: str
+            Custom plot title
+            Default is filename with linespacing and resolution information
+
+        Returns
+        -------
+        none
+
+        """
+        return NotImplementedError("show_depth method not implemented in base BathymetryDataset class.")
 
 
 
@@ -111,7 +127,7 @@ class RasterDataset(BathymetryDataset):
         return self.metadata['ndv_value']
 
 
-    def show_depth(self, title: str = None):
+    def show_depth(self, title: Union[str, None] = None):
         """
         Plots the depth for visualization
         Parameters
@@ -126,18 +142,32 @@ class RasterDataset(BathymetryDataset):
 
         """
         fig, ax1 = plt.subplots()
-        im = ax1.imshow(self, cmap='terrain', aspect='equal')
         res = self.metadata['resolution']
-        shape_0 = self.shape[0]
-        shape_1 = self.shape[1]
-        fig.colorbar(im, label='Depth (m)')
-        locs = ax1.get_xticks()
-        ax1.set_xticks(locs)
-        ax1.set_xticklabels([str(int(x * res)) for x in locs])
-        locs = ax1.get_yticks()
-        ax1.set_yticks(locs)
-        ax1.set_yticklabels([str(int(y * res)) for y in locs])
-        ax1.tick_params(axis='x', labelrotation=90)
+        if self.filetype == 'raster':
+            im = ax1.imshow(self, cmap='terrain', aspect='equal')
+            shape_0 = self.shape[0]
+            shape_1 = self.shape[1]
+            fig.colorbar(im, label='Depth (m)')
+            locs = ax1.get_xticks()
+            ax1.set_xticks(locs)
+            ax1.set_xticklabels([str(int(x * res)) for x in locs])
+            locs = ax1.get_yticks()
+            ax1.set_yticks(locs)
+            ax1.set_yticklabels([str(int(y * res)) for y in locs])
+            ax1.tick_params(axis='x', labelrotation=90)
+            ax1.set_xlim(left=0, right=shape_1)
+            ax1.set_ylim(top=0, bottom=shape_0)
+        elif self.filetype == 'points':
+            x = self[:, 0]
+            y = self[:, 1]
+            depth = self[:, 2]
+            sc = ax1.scatter(x, y, c=depth, cmap='terrain', marker='.', s=1)
+            fig.colorbar(sc, label='Depth (m)')
+            shape_0 = int((np.max(y) - np.min(y)) / res)
+            shape_1 = int((np.max(x) - np.min(x)) / res)
+        else:
+            raise ValueError(f"Unrecognized file type for plotting: {self.filetype}")
+
         ax1.set_xlabel("West-East (m)")
         ax1.set_ylabel("North-South (m)")
         if title is None:
@@ -147,8 +177,7 @@ class RasterDataset(BathymetryDataset):
                     Surface:{title} at {res}m resolution
                     Dimensions: {shape_0 * res / 1000}km by {shape_1 * res / 1000}km
                         """)
-        ax1.set_xlim(left=0, right=shape_1)
-        ax1.set_ylim(top=0, bottom=shape_0)
+        
 
 
     def __repr__(self):

@@ -48,7 +48,7 @@ def return_reader(file_ext: str) -> Union[RasterReader, CSVReader, BPSReader]:
     """
     if file_ext == "csv":
         return CSVReader()
-    elif file_ext in ["tif", "tiff"]:
+    elif file_ext in ["tif", "tiff", "bag"]:
         return RasterReader()
     elif file_ext == "bps":
         return BPSReader()
