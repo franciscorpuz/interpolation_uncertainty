@@ -1,3 +1,4 @@
+
 name: interpolation_uncertainty
 channels:
   - defaults
@@ -7,4 +8,7 @@ dependencies:
   - jupyterlab
   - matplotlib
   - scipy
-prefix: C:\ProgramData\miniconda3\envs\interpolation_uncertainty
+  - libgdal-hdf5
+  - scikit-learn
+  - scikit-image
+  - tqdm
