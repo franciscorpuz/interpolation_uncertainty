@@ -6,7 +6,11 @@ Fully surveying the seafloor at the resolution required for all navigational and
 
 The core challenge is that we have no direct measurements in the very regions we are trying to characterize. This library addresses that challenge by exploiting the spatial structure of nearby known bathymetry. Under an assumption of spatial isotropy — that the statistical character of the seafloor is consistent regardless of direction — the variance observed in sampled survey lines can be used to estimate the likely variance at different spatial scales across the interpolated gaps.
 
-interpolation_uncertainty implements and compares two families of methods for making this estimate: Spectral Energy and Spatial Distrubution
+interpolation_uncertainty implements and compares two families of methods for making this estimate:
+
+Spectral methods analyze the power spectral density (PSD) of the seafloor along known survey lines. By cumulatively summing variance across spatial frequency bins — starting from the highest frequency and working toward scales matching the distance from a known measurement — these methods estimate the likely interpolation error at any given location.
+Spatial methods use sliding-window statistics (standard deviation, min/max envelopes, Gaussian smoothing) computed directly from the depth field to characterize local variability.
+To evaluate and develop these methods, the library simulates sparse surveying on full-coverage raster datasets: it subsamples every N-th column as a synthetic survey line, linearly interpolates across the gaps, and computes the true residual between the interpolated and actual seafloor. This residual serves as ground truth for validating each uncertainty estimate across different seafloor types (flat, rough, sloped).
 
 ## Installation
 
