@@ -166,3 +166,6 @@ uv.lock
 
 # VS Code
 .vscode/
+
+# Claude Files
+CLAUDE.md
