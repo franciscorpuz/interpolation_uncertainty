@@ -9,12 +9,14 @@ version = "0.0.1"
 description = "Python Codes for testing various Uncertainty Estimation methods"
 requires-python = ">=3.10"
 dependencies = [
-    "build",
     "gdal<3.12",
     "matplotlib",
-    "jupyterlab",
+    "numpy",
+    "pillow",
     "scipy",
-    "libgdal-hdf5"
+    "scikit-image",
+    "scikit-learn",
+    "tqdm",
 ]
 authors = [
   {name = "Francis Corpuz", email = "francis.corpuz@noaa.gov"},
@@ -27,7 +29,7 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
     "Intended Audience :: Developers",
-    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
     "Topic :: Scientific/Engineering :: Information Analysis",
     "Topic :: Scientific/Engineering :: Oceanography",
 ]
@@ -37,6 +39,8 @@ Homepage = "https://nauticalcharts.noaa.gov/learn/nbs.html"
 
 [dependency-groups]
 dev = [
-    "pytest"
+    "ipykernel",
+    "jupyterlab",
+    "pytest",
 ]
 
