@@ -48,23 +48,69 @@ See the notebooks in `notebooks/` for usage examples. The primary working notebo
 `uncertainty_sim_nbs_dataset.ipynb`.
 
 ```python
-from interpolation_uncertainty.core.loadfile import load_file
-from interpolation_uncertainty.processors.rasterProcessor import RasterProcessor
+from interpolation_uncertainty import (
+    read_file, show_depth,
+    build_coverage_mask,
+    compute_dominant_angle_radon_transform, compute_local_orientation,
+    detect_trackline_positions, assign_depths_to_lines,
+    build_uncertainty_raster, undo_rotation,
+)
+from skimage.morphology import opening, thin, disk
 
-# Read bathymetry data from file
-bathy_data = load_file("data/raster/BlueTopo.tiff")
+# 1. Load bathymetric raster
+bathy_data = read_file("data/raster/H13060_MB_4m_MLLW_3of3.bag", verbose=True)
+show_depth(bathy_data, cmap='viridis')
 
-# Visualize the dataset
-bathy_data.show_depth()
+# 2. Build binary coverage mask
+bathy_binary = build_coverage_mask(bathy_data)
 
-# Create processor with specified subsampling parameters
-processor = RasterProcessor(linespacing_meters=256, max_multiple=1, multiple=1)
+# 3-4. Morphological filtering + skeletonisation to isolate tracklines
+bathy_lines = bathy_binary & ~opening(bathy_binary, disk(5))
+bathy_thin = thin(bathy_lines) > 0
 
-# Compute the residual surface
-residual = processor.compute_residual_surface(bathy_data)
+# 5. Radon transform to find dominant line orientations
+dominant = compute_dominant_angle_radon_transform(bathy_thin, circle=False)
 
-# Compute uncertainty using PSD spectrum
-uncertainty = processor.estimate_uncertainty(method='psd_v1', residual_data=residual)
+# 6. PCA-based local angle estimation
+local_orientations = compute_local_orientation(bathy_thin, line_length=50, num_neighbors=20)
+
+# 7-14. For each dominant angle: detect lines, assign depths, compute uncertainty
+for angle in dominant['peaks']:
+    # Extract pixels near this angle
+    low, high = (angle - 5) % 180, (angle + 5) % 180
+    if low < high:
+        angle_mask = (local_orientations >= low) & (local_orientations < high)
+    else:
+        angle_mask = (local_orientations >= low) | (local_orientations < high)
+
+    # Detect trackline positions and assign depth values
+    peaks, restored_mask, angle_to_rotate = detect_trackline_positions(
+        angle_mask, bathy_binary, angle,
+    )
+    depth_raster = assign_depths_to_lines(
+        restored_mask, bathy_binary, bathy_data, angle_to_rotate,
+    )
+
+    # Compute spectral uncertainty and rotate back to original orientation
+    uncertainty = build_uncertainty_raster(
+        peaks, restored_mask, depth_raster, bathy_data['metadata']['resolution'],
+    )
+    result = undo_rotation(uncertainty, angle_to_rotate, bathy_binary.shape)
+```
+
+### Package structure
+
+```
+interpolation_uncertainty
+├── io              — read_file (GDAL-backed raster/BAG I/O)
+├── visualization   — show_depth (plotting)
+├── preprocessing
+│   ├── morphology  — build_coverage_mask, morphological filters
+│   ├── orientation — Radon transform, PCA-based local angles
+│   └── geometry    — point rotation, undo_rotation
+├── methods         — compute_uncertainty (FFT/PSD spectral energy)
+└── pipeline        — detect_trackline_positions, assign_depths_to_lines,
+                      process_line_pair, build_uncertainty_raster
 ```
 
 ## How to cite interpolation_uncertainty
