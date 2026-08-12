@@ -5,7 +5,6 @@ from .preprocessing import (
     filter_blobs_keep_lines,
     filter_squares_keep_lines,
     filter_morphological_operations,
-    compute_dominant_angle_radon_transform,
     compute_local_orientation,
     rotate_points,
     update_geotransform,
