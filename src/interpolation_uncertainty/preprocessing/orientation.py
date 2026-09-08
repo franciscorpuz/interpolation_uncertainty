@@ -53,14 +53,8 @@ def compute_local_orientation(binary_image,
                                                                      kwargs.get('circle', True),
                                                                      kwargs.get('tol', 5),
                                                                      kwargs.get('precomputed_theta', None))
-    elif method == 'prob_line':
-        point_orientations, angle_info = orientation_via_probabilistic_line(binary_image,
-                                                                     kwargs.get('test_angles', None),
-                                                                     kwargs.get('circle', True),
-                                                                     kwargs.get('tol', 5),
-                                                                     kwargs.get('precomputed_theta', None))
     else:
-        raise ValueError(f"Invalid method: {method}. Must be one of the following: 'pca', 'radon', prob_line.")
+        raise ValueError(f"Invalid method: {method}. Must be one of the following: 'pca', 'radon'")
 
     if plot_orientation:
         plt.figure(figsize=figsize)
@@ -82,7 +76,7 @@ def orientation_via_probabilistic_line(binary_image,
     """Compute local orientation for each point in a binary image using probabilistic line
 
     Steps:
-    1. randomly select from the binarized image
+    1. randomly select point from the binarized image
     2. compute the nearest neighbors according to the num_neighbors parameter
     3. compute the mean distance between consecutive points in (2)
     4. compute the angle_orientation and equation of line made by the points in (2) using PCA
@@ -118,7 +112,10 @@ def orientation_via_probabilistic_line(binary_image,
         histogram of the angle scores detected by 'pca'
     """
 
+    # Convert binary image to list of coordinates
     X_linear = np.argwhere(binary_image)  # Extract coordinates of True values
+
+    # Create map to track labeled points
     X_map = np.float32(binary_image) * np.nan
 
     # 1. Create a field of points
@@ -126,9 +123,10 @@ def orientation_via_probabilistic_line(binary_image,
     angle_scores = []
     pca = PCA(n_components=1)
 
-    for i in tqdm(range(len(X_linear))):
+    # continue until all points are labeled
+    while np.any(np.isnan(X_map)):
         # 2. Parameters for the chain
-        start_idx = i
+        start_idx = np.int(np.random.choice(np.where(~np.isnan(X_map))[0]))
         chain = [start_idx]
         visited = {start_idx}
 
@@ -157,6 +155,9 @@ def orientation_via_probabilistic_line(binary_image,
         angle_radians = np.arctan2(direction[1], direction[0])  # atan2(y, x)
         angle_scores.append(np.degrees(angle_radians))
 
+        # Find all points lying within n_pixels of the line
+
+
     angle_scores = np.array(angle_scores) - 90  # Shift angles by 90 degrees
     angle_scores = angle_scores % 180  # Wrap angles to [0, 180)
     point_orientations = np.full_like(binary_image, fill_value=np.nan, dtype=np.float64)
@@ -166,6 +167,8 @@ def orientation_via_probabilistic_line(binary_image,
                                     bins=180)
 
     return point_orientations, angle_profile
+
+
 
 def orientation_via_PCA(binary_image,
                               line_length=20,
@@ -301,6 +304,7 @@ def orientation_via_radon(binary_image: np.ndarray,
         if test_angles is None:
             theta = np.linspace(0., 180., 180, endpoint=False)
         else:
+            print(f"Using pre-computed angles: {precomputed_theta}")
             theta = test_angles
         angle_step = theta[1] - theta[0]
 
@@ -322,7 +326,7 @@ def orientation_via_radon(binary_image: np.ndarray,
         # Detect peaks in the variance profile
         # rough estimate: foreground_points / expected_tracklines_per_angle
         # min_peak_prominence = len(x_coords) // (n_angles * expected_lines_per_angle)
-        peaks, properties = find_peaks(profile_variance_xy, prominence=(None, None))
+        peaks, properties = find_peaks(profile_variance_xy, prominence=(None, None), width=tol)
 
         print(f"Detected peaks:{peaks}")
         print(f"Properties: {properties}")
@@ -343,12 +347,14 @@ def orientation_via_radon(binary_image: np.ndarray,
     if tol is None:
         tol = int(np.ceil(np.max(widths_in_degrees) / 2))
     else:
-        tol = max(tol, int(np.ceil(np.max(widths_in_degrees) / 2)))
+        tol = max(tol/2, int(np.ceil(np.max(widths_in_degrees) / 2)))
+    print(f"Using tolerance: {tol}")
 
     # Convert peaks to rho-space
-    # peaks = (peaks + 90 ) % 180
+    peaks = (peaks + 90 ) % 180
+
     print("Labeling points...")
-    labels, peak_centers_per_angle = label_points_by_angle(x_coords,
+    labels, peak_centers_per_angle = label_points_by_probabilistic_line(x_coords,
                                                            y_coords,
                                                            peaks,
                                                            bin_width=10.0,
@@ -475,4 +481,155 @@ def label_points_by_angle(x,
     labels = np.where(best_dist <= tol, best_k, -1)
 
     return labels, all_peak_centers
+
+
+def label_points_by_probabilistic_line(x, y,
+                                      theta_degs,
+                                      bin_width=1.0,
+                                      tol=5,
+                                      min_peak_prominence=5,
+                                      num_neighbors=50,
+                                      chain_length=20):
+    """
+    Assign each point to its closest trackline family across all dominant angles.
+
+    Compute local orientation for each point in a binary image using probabilistic line
+
+    Steps:
+    1. randomly select point from the binarized image
+    2. compute the nearest neighbors according to the num_neighbors parameter
+    3. compute the mean distance between consecutive points in (2)
+    4. compute the angle_orientation and equation of line made by the points in (2) using PCA
+    4a. replace the computed slope with the nearest value found in theta_degs that is within angle_tol degrees of the computed slope
+    5. compute all points lying within n_pixels of the line from (4a)
+    6. create a subcluster of points in (5) starting from starting point (1) that is within distance computed in (3)
+    7. label all points in this subcluster having a local angle orientation of (4)
+    8. record all previous labels attached to a point
+    9. repeat steps 2-8 until all points are labeled
+    10. compute the average angle orientation of all points in the subcluster
+
+
+    Parameters
+    ----------
+    x, y : array-like
+        Column and row coordinates of foreground pixels.
+    theta_degs : array-like
+        Image-convention dominant angles in degrees (as returned by
+        ``compute_local_orientation_via_radon`` after the −90° correction).
+    bin_width : float
+        Maximum perpendicular distance (pixels) from the fitted line for a
+        point to be considered part of that line segment. Default is 1.0.
+    angle_tol : float
+        Maximum angular difference (degrees) between the PCA-computed angle
+        and the nearest entry in ``theta_degs`` for the snap to be accepted.
+        Points whose chain angle cannot be snapped are labeled −1. Default 5.
+    min_peak_prominence : float
+        Unused in this method; kept for API symmetry with
+        ``label_points_by_angle``.
+    num_neighbors : int
+        Number of nearest neighbours queried at each chain-extension step.
+        Higher values reduce the chance of getting stuck. Default is 50.
+    chain_length : int
+        Maximum number of points in each local chain used for PCA. Default 20.
+
+    Returns
+    -------
+    labels : np.ndarray of int
+        Per-point index into ``theta_degs`` (i.e. the assigned angle family),
+        or −1 if the point is unassigned.
+    all_peak_centers : list
+        Empty list; returned for API symmetry with ``label_points_by_angle``.
+        This method does not compute ρ-space trackline centers.
+    """
+    theta_degs = np.asarray(theta_degs, dtype=float)
+    x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
+    n_points = len(x)
+
+    # (col, row) ordering gives angle 0° = horizontal, 90° = vertical,
+    # matching the convention used by orientation_via_PCA and orientation_via_radon.
+    pts = np.column_stack([x, y])
+    tree = KDTree(pts)
+
+    labels = np.full(n_points, -1, dtype=int)
+    labeled = np.zeros(n_points, dtype=bool)
+    pca = PCA(n_components=1)
+    rng = np.random.default_rng(42)
+
+    while not np.all(labeled):
+        # Step 1: randomly pick an unlabeled starting point
+        unlabeled_indices = np.where(~labeled)[0]
+        start_idx = int(rng.choice(unlabeled_indices))
+
+        # Steps 2-3: build a greedy chain and measure mean inter-point spacing
+        chain = [start_idx]
+        visited = {start_idx}
+        for _ in range(chain_length - 1):
+            _, indices = tree.query(pts[chain[-1]].reshape(1, -1), k=num_neighbors + 1)
+            found = False
+            for ni in indices[0]:
+                if ni not in visited:
+                    chain.append(ni)
+                    visited.add(ni)
+                    found = True
+                    break
+            if not found:
+                break
+
+        chain_pts = pts[chain]
+        if len(chain) < 2:
+            labeled[start_idx] = True
+            continue
+
+        mean_dist = np.mean(np.linalg.norm(np.diff(chain_pts, axis=0), axis=1))
+
+        # Step 4: PCA gives the dominant direction of the chain
+        pca.fit(chain_pts)
+        direction = pca.components_[0]
+        # arctan2(row_component, col_component): 0°=horizontal, 90°=vertical
+        angle_deg = np.degrees(np.arctan2(direction[1], direction[0])) % 180
+
+        # Step 4a: snap to the nearest Radon-detected angle within angle_tol
+        # Circular difference in [0, 180) wraps through 0°/180°
+        diffs = np.abs(((theta_degs - angle_deg + 90) % 180) - 90)
+        best = int(np.argmin(diffs))
+        if diffs[best] > tol:
+            labeled[start_idx] = True
+            continue
+
+        snapped_angle = theta_degs[best]
+
+        # Step 5: find all points within bin_width of the line through
+        # start_idx with the snapped orientation (perpendicular distance filter)
+        angle_rad = np.deg2rad(snapped_angle)
+        normal = np.array([-np.sin(angle_rad), np.cos(angle_rad)])
+        perp_dist = np.abs((pts - pts[start_idx]) @ normal)
+        near_idx = np.where(perp_dist <= bin_width)[0]  # sorted, start_idx always included
+
+        # Step 6: BFS connected component from start_idx within the near-line
+        # set, using 2 * mean_dist as the adjacency radius to handle gaps
+        near_pts = pts[near_idx]
+        sub_tree = KDTree(near_pts)
+        start_local = int(np.searchsorted(near_idx, start_idx))
+        step_radius = mean_dist * 2.0
+
+        subcluster_local = set()
+        queue = [start_local]
+        sub_seen = {start_local}
+        while queue:
+            cur = queue.pop(0)
+            subcluster_local.add(cur)
+            for ni in sub_tree.query_ball_point(near_pts[cur], r=step_radius):
+                if ni not in sub_seen:
+                    sub_seen.add(ni)
+                    queue.append(ni)
+
+        # Steps 7-8: assign the snapped angle label to every unlabeled point
+        # in the connected segment; already-labeled points keep their first label
+        subcluster_global = near_idx[list(subcluster_local)]
+        for idx in subcluster_global:
+            if not labeled[idx]:
+                labels[idx] = best
+                labeled[idx] = True
+
+    return labels, []
 
