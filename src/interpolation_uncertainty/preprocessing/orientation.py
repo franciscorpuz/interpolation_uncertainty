@@ -1,4 +1,5 @@
 import numpy as np
+from collections import deque
 from tqdm import tqdm
 from matplotlib import pyplot as plt
 from sklearn.decomposition import PCA
@@ -58,7 +59,8 @@ def compute_local_orientation(binary_image,
 
     if plot_orientation:
         plt.figure(figsize=figsize)
-        plt.imshow(point_orientations, cmap=cmap)
+        plt.scatter(point_orientations[:,0], point_orientations[:,1], s=10, cmap='viridis', vmin=0, vmax=180,
+                    label='Local Orientation (degrees)')
         plt.colorbar(label='Orientation (degrees)', shrink=0.5)
         plt.title(f"Local Orientations via {method.upper()}")
         plt.xlabel("X")
@@ -316,8 +318,13 @@ def orientation_via_radon(binary_image: np.ndarray,
         print("Radon Computation Done.")
 
         # Plot profile variance
-        plt.figure(figsize=(10, 6))
+        plt.figure(figsize=(10, 8))
         plt.plot(profile_variance_xy, label="Profile Variance")
+        plt.xlabel("Angle (degrees)")
+        plt.ylabel("Variance")
+        plt.title("Variance Profile")
+        plt.figure(figsize=(10, 8))
+        plt.plot(np.log1p(profile_variance), label="Log Profile Variance")
         plt.xlabel("Angle (degrees)")
         plt.ylabel("Variance")
         plt.title("Variance Profile")
@@ -326,40 +333,39 @@ def orientation_via_radon(binary_image: np.ndarray,
         # Detect peaks in the variance profile
         # rough estimate: foreground_points / expected_tracklines_per_angle
         # min_peak_prominence = len(x_coords) // (n_angles * expected_lines_per_angle)
-        peaks, properties = find_peaks(profile_variance_xy, prominence=(None, None), width=tol)
+        peaks, properties = find_peaks(profile_variance_xy, distance=tol*2, prominence=None)
 
         print(f"Detected peaks:{peaks}")
-        print(f"Properties: {properties}")
+        # print(f"Properties: {properties}")
 
-        widths, _, _, _ = peak_widths(profile_variance, peaks, rel_height=0.5)
-        widths_in_degrees = widths * angle_step
-
-        # sort the peaks by variance and return the most dominant angle and its width
-        peak_indices = np.argsort(np.array(properties['prominences']))[::-1]
-        peaks = peaks[peak_indices]
-        widths_in_degrees = widths_in_degrees[peak_indices]
+        # widths, _, _, _ = peak_widths(profile_variance, peaks, rel_height=0.5)
+        # widths_in_degrees = widths * angle_step
+        #
+        # # sort the peaks by variance and return the most dominant angle and its width
+        # peak_indices = np.argsort(np.array(profile_variance[peaks]))[::-1]
+        # peaks = peaks[peak_indices]
     else:
         peaks = precomputed_theta['peaks']
-        widths_in_degrees = precomputed_theta['widths_in_degrees']
         profile_variance = precomputed_theta['profile_variance']
 
     # tol: use at least half the FWHM of the widest detected peak
-    if tol is None:
-        tol = int(np.ceil(np.max(widths_in_degrees) / 2))
-    else:
-        tol = max(tol/2, int(np.ceil(np.max(widths_in_degrees) / 2)))
-    print(f"Using tolerance: {tol}")
+    # if tol is None:
+    #     tol = int(np.ceil(np.max(widths_in_degrees) / 2))
+    # else:
+    #     tol = max(tol/2, int(np.ceil(np.max(widths_in_degrees) / 2)))
+    # print(f"Using tolerance: {tol}")
 
     # Convert peaks to rho-space
-    peaks = (peaks + 90 ) % 180
+    # peaks = (peaks + 90 ) % 180
+    # print(f"Converted peaks to rho-space: {peaks}")
 
     print("Labeling points...")
     labels, peak_centers_per_angle = label_points_by_probabilistic_line(x_coords,
                                                            y_coords,
                                                            peaks,
-                                                           bin_width=10.0,
+                                                           bin_width=5.0,
                                                            tol=tol,
-                                                           min_peak_prominence=None)
+                                                           chain_length=10)
     print("Labeling points... Done.")
 
 
@@ -379,7 +385,7 @@ def orientation_via_radon(binary_image: np.ndarray,
 
     theta_info = {
         "peaks": np.array(peaks),
-        "widths_in_degrees": np.array(widths_in_degrees),
+        # "widths_in_degrees": np.array(widths_in_degrees),
         "profile_variance": np.array(profile_variance),
     }
 
@@ -487,27 +493,34 @@ def label_points_by_probabilistic_line(x, y,
                                       theta_degs,
                                       bin_width=1.0,
                                       tol=5,
-                                      min_peak_prominence=5,
-                                      num_neighbors=50,
-                                      chain_length=20):
+                                      num_neighbors=5,
+                                      chain_length=100,
+                                      n_times=3):
     """
-    Assign each point to its closest trackline family across all dominant angles.
+    Assign each point a local angle orientation using probabilistic line fitting.
 
-    Compute local orientation for each point in a binary image using probabilistic line
+    Runs a multi-vote ensemble: the core algorithm is repeated until every
+    point has been visited at least ``n_times``, and the final label is the
+    angle family that received the most votes (mode).  Points that are always
+    near a trackline boundary get their correct family reinforced across
+    independent random probes, suppressing one-off mislabels.
 
-    Steps:
-    1. randomly select point from the binarized image
-    2. compute the nearest neighbors according to the num_neighbors parameter
-    3. compute the mean distance between consecutive points in (2)
-    4. compute the angle_orientation and equation of line made by the points in (2) using PCA
-    4a. replace the computed slope with the nearest value found in theta_degs that is within angle_tol degrees of the computed slope
-    5. compute all points lying within n_pixels of the line from (4a)
-    6. create a subcluster of points in (5) starting from starting point (1) that is within distance computed in (3)
-    7. label all points in this subcluster having a local angle orientation of (4)
-    8. record all previous labels attached to a point
-    9. repeat steps 2-8 until all points are labeled
-    10. compute the average angle orientation of all points in the subcluster
-
+    Steps (per iteration):
+    1. Randomly select an under-labeled point from the foreground.
+    2. Greedily chain ``chain_length`` nearest neighbours to build a local
+       linear probe.
+    3. Compute the mean inter-point distance along the chain.
+    4. Fit PCA to the chain; extract the dominant direction as an angle.
+    4a. Snap the angle to the closest entry in ``theta_degs`` (within ``tol``);
+        discard the probe (no vote) if no entry is close enough.
+    5. Find all foreground points within ``bin_width`` pixels perpendicular
+       to the snapped line through the starting point.
+    6. Flood-fill a connected segment from the starting point through the
+       near-line set, using ``2 × mean_dist`` as the adjacency radius.
+    7. Cast one vote for the snapped angle family on every under-labeled
+       point in the connected segment.
+    8. Repeat until every point has been visited ``n_times``.
+    9. Resolve each point's label as ``argmax`` of its vote histogram.
 
     Parameters
     ----------
@@ -519,24 +532,25 @@ def label_points_by_probabilistic_line(x, y,
     bin_width : float
         Maximum perpendicular distance (pixels) from the fitted line for a
         point to be considered part of that line segment. Default is 1.0.
-    angle_tol : float
+    tol : float
         Maximum angular difference (degrees) between the PCA-computed angle
         and the nearest entry in ``theta_degs`` for the snap to be accepted.
-        Points whose chain angle cannot be snapped are labeled −1. Default 5.
-    min_peak_prominence : float
-        Unused in this method; kept for API symmetry with
-        ``label_points_by_angle``.
+        Probes that cannot be snapped cast no vote. Default is 5.
     num_neighbors : int
         Number of nearest neighbours queried at each chain-extension step.
-        Higher values reduce the chance of getting stuck. Default is 50.
+        Higher values reduce the chance of getting stuck. Default is 20.
     chain_length : int
-        Maximum number of points in each local chain used for PCA. Default 20.
+        Maximum number of points in each local chain used for PCA. Default 10.
+    n_times : int
+        Minimum number of votes each point must accumulate before the loop
+        terminates. Higher values reduce mislabels at the cost of runtime.
+        Default is 3.
 
     Returns
     -------
     labels : np.ndarray of int
-        Per-point index into ``theta_degs`` (i.e. the assigned angle family),
-        or −1 if the point is unassigned.
+        Per-point index into ``theta_degs`` (i.e. the winning angle family),
+        or −1 if the point received no valid votes.
     all_peak_centers : list
         Empty list; returned for API symmetry with ``label_points_by_angle``.
         This method does not compute ρ-space trackline centers.
@@ -544,92 +558,287 @@ def label_points_by_probabilistic_line(x, y,
     theta_degs = np.asarray(theta_degs, dtype=float)
     x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
     n_points = len(x)
+    n_angles = len(theta_degs)
 
     # (col, row) ordering gives angle 0° = horizontal, 90° = vertical,
     # matching the convention used by orientation_via_PCA and orientation_via_radon.
     pts = np.column_stack([x, y])
     tree = KDTree(pts)
 
-    labels = np.full(n_points, -1, dtype=int)
-    labeled = np.zeros(n_points, dtype=bool)
+    # label_votes[i, k] = number of times point i was assigned to angle family k
+    label_votes = np.zeros((n_points, n_angles), dtype=int)
+    # label_counts[i] = total labeling attempts on point i (votes + no-snap misses)
+    label_counts = np.zeros(n_points, dtype=int)
+
     pca = PCA(n_components=1)
     rng = np.random.default_rng(42)
 
-    while not np.all(labeled):
-        # Step 1: randomly pick an unlabeled starting point
-        unlabeled_indices = np.where(~labeled)[0]
-        start_idx = int(rng.choice(unlabeled_indices))
+    with tqdm(total=n_points * n_times, desc="Probabilistic line labeling") as pbar:
+        prev_total = 0
+        while not np.all(label_counts >= n_times):
+            # Step 1: randomly pick a point that still needs more votes
+            under_idx = np.where(label_counts < n_times)[0]
+            start_idx = int(rng.choice(under_idx))
 
-        # Steps 2-3: build a greedy chain and measure mean inter-point spacing
-        chain = [start_idx]
-        visited = {start_idx}
-        for _ in range(chain_length - 1):
-            _, indices = tree.query(pts[chain[-1]].reshape(1, -1), k=num_neighbors + 1)
-            found = False
-            for ni in indices[0]:
-                if ni not in visited:
-                    chain.append(ni)
-                    visited.add(ni)
-                    found = True
+            # Steps 2-3: bidirectional chain — grow half forward, half backward
+            # so start_idx stays near the middle and the PCA line passes through it.
+            chain = deque([start_idx])
+            visited = {start_idx}
+            half = (chain_length - 1) // 2
+
+            # Forward leg: extend from the front end
+            front = start_idx
+            for _ in range(half):
+                _, indices = tree.query(pts[front].reshape(1, -1), k=num_neighbors + 1)
+                found = False
+                for ni in indices[0]:
+                    if ni not in visited:
+                        chain.append(ni)
+                        visited.add(ni)
+                        front = ni
+                        found = True
+                        break
+                if not found:
                     break
-            if not found:
+
+            # Backward leg: extend from the back end (opposite side of start_idx)
+            # visited already contains the forward points, so the nearest unvisited
+            # neighbour of start_idx naturally reaches the other direction.
+            back = start_idx
+            for _ in range(chain_length - 1 - half):
+                _, indices = tree.query(pts[back].reshape(1, -1), k=num_neighbors + 1)
+                found = False
+                for ni in indices[0]:
+                    if ni not in visited:
+                        chain.appendleft(ni)
+                        visited.add(ni)
+                        back = ni
+                        found = True
+                        break
+                if not found:
+                    break
+
+            chain_pts = pts[list(chain)]
+            if len(chain) < 2:
+                label_counts[start_idx] += 1
+                pbar.update(label_counts.sum() - prev_total)
+                prev_total = label_counts.sum()
+                continue
+
+            mean_dist = np.mean(np.linalg.norm(np.diff(chain_pts, axis=0), axis=1))
+
+            # Step 4: PCA dominant direction → angle
+            pca.fit(chain_pts)
+            direction = pca.components_[0]
+            # arctan2(row_component, col_component): 0°=horizontal, 90°=vertical
+            angle_deg = np.degrees(np.arctan2(direction[1], direction[0])) % 180
+
+            # Step 4a: snap to the nearest Radon-detected angle within tol
+            diffs = np.abs(((theta_degs - angle_deg + 90) % 180) - 90)
+            best = int(np.argmin(diffs))
+            if diffs[best] > tol:
+                # No valid family — count the attempt so this point can still
+                # reach n_times and won't block loop termination
+                label_counts[start_idx] += 1
+                pbar.update(label_counts.sum() - prev_total)
+                prev_total = label_counts.sum()
+                continue
+
+            snapped_angle = theta_degs[best]
+
+            # Step 5: points within bin_width perpendicular to the snapped line
+            angle_rad = np.deg2rad(snapped_angle)
+            normal = np.array([-np.sin(angle_rad), np.cos(angle_rad)])
+            perp_dist = np.abs((pts - pts[start_idx]) @ normal)
+            # near_idx = np.where(perp_dist <= bin_width)[0]  # sorted; start_idx always present
+            near_idx = np.where(perp_dist <= mean_dist)[0]
+
+            # Step 6: BFS connected segment — 2×mean_dist adjacency radius
+            near_pts = pts[near_idx]
+            sub_tree = KDTree(near_pts)
+            start_local = int(np.searchsorted(near_idx, start_idx))
+            step_radius = mean_dist * 2.0
+
+            subcluster_local = set()
+            queue = [start_local]
+            sub_seen = {start_local}
+            while queue:
+                cur = queue.pop(0)
+                subcluster_local.add(cur)
+                for ni in sub_tree.query_ball_point(near_pts[cur], r=step_radius):
+                    if ni not in sub_seen:
+                        sub_seen.add(ni)
+                        queue.append(ni)
+
+            # Steps 7-8: cast one vote on every under-labeled point in the segment
+            subcluster_global = near_idx[list(subcluster_local)]
+            for idx in subcluster_global:
+                if label_counts[idx] < n_times:
+                    label_votes[idx, best] += 1
+                    label_counts[idx] += 1
+
+            curr_total = label_counts.sum()
+            pbar.update(curr_total - prev_total)
+            prev_total = curr_total
+
+    # Step 9: resolve each point's label as the winning angle family (mode)
+    total_votes = label_votes.sum(axis=1)
+    labels = np.where(total_votes > 0, np.argmax(label_votes, axis=1), -1)
+
+    return labels, []
+
+
+def label_points_by_probabilistic_line2(x, y,
+                                        theta_degs,
+                                        bin_width=1.0,
+                                        tol=5,
+                                        num_neighbors=20,
+                                        chain_length=10,
+                                        min_tentative=5):
+    """
+    Two-tier probabilistic line labeling without BFS connectivity.
+
+    Each randomly selected point receives a **definitive** label from its
+    local PCA angle (snapped to a Radon-detected family).  Every point that
+    lies within ``bin_width`` pixels of that line receives one **tentative**
+    vote for the same family.  The loop runs until every point has either
+    been selected once or accumulated at least ``min_tentative`` tentative
+    votes, whichever comes first.  Final labels are the definitive label for
+    selected points and the majority-vote angle for the rest.
+
+    Compared to ``label_points_by_probabilistic_line``, this variant:
+
+    * Removes the BFS connected-component step — near-line membership is a
+      pure perpendicular-distance test, vectorised over all points.
+    * Separates definitive (strong) from tentative (weak) evidence, so a
+      point selected as a start always gets the label its own chain implies,
+      while boundary points accumulate evidence from many passing probes.
+
+    Parameters
+    ----------
+    x, y : array-like
+        Column and row coordinates of foreground pixels.
+    theta_degs : array-like
+        Image-convention dominant angles in degrees (Radon-detected).
+    bin_width : float
+        Maximum perpendicular distance (pixels) for a point to receive a
+        tentative vote from a passing line. Default is 1.0.
+    tol : float
+        Maximum angular difference (degrees) between the PCA angle and the
+        nearest ``theta_degs`` entry for the snap to be accepted. Default 5.
+    num_neighbors : int
+        Nearest-neighbour count for each chain-extension query. Default 20.
+    chain_length : int
+        Maximum chain length for PCA; ``start_idx`` sits near the middle
+        via bidirectional growth. Default 10.
+    min_tentative : int
+        Minimum tentative votes a non-selected point must receive before it
+        is considered sufficiently labeled. Default 5.
+
+    Returns
+    -------
+    labels : np.ndarray of int
+        Per-point index into ``theta_degs``, or −1 if unresolved.
+    all_peak_centers : list
+        Empty list; for API symmetry with ``label_points_by_angle``.
+    """
+    theta_degs = np.asarray(theta_degs, dtype=float)
+    x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
+    n_points = len(x)
+    n_angles = len(theta_degs)
+
+    pts = np.column_stack([x, y])
+    tree = KDTree(pts)
+
+    selected = np.zeros(n_points, dtype=bool)
+    definitive_labels = np.full(n_points, -1, dtype=int)
+    tentative_votes = np.zeros((n_points, n_angles), dtype=int)
+    tentative_counts = np.zeros(n_points, dtype=int)
+
+    pca = PCA(n_components=1)
+    rng = np.random.default_rng(42)
+
+    with tqdm(total=n_points, desc="Probabilistic line labeling v2") as pbar:
+        prev_satisfied = 0
+        while True:
+            # Candidates: unselected points that still need more tentative votes.
+            # When this pool is empty every point is either selected or has
+            # enough votes — the termination condition is met.
+            candidates = np.where(~selected & (tentative_counts < min_tentative))[0]
+            if len(candidates) == 0:
                 break
 
-        chain_pts = pts[chain]
-        if len(chain) < 2:
-            labeled[start_idx] = True
-            continue
+            start_idx = int(rng.choice(candidates))
 
-        mean_dist = np.mean(np.linalg.norm(np.diff(chain_pts, axis=0), axis=1))
+            # Bidirectional chain so start_idx sits near the middle
+            chain = deque([start_idx])
+            visited = {start_idx}
+            half = (chain_length - 1) // 2
 
-        # Step 4: PCA gives the dominant direction of the chain
-        pca.fit(chain_pts)
-        direction = pca.components_[0]
-        # arctan2(row_component, col_component): 0°=horizontal, 90°=vertical
-        angle_deg = np.degrees(np.arctan2(direction[1], direction[0])) % 180
+            front = start_idx
+            for _ in range(half):
+                _, indices = tree.query(pts[front].reshape(1, -1), k=num_neighbors + 1)
+                found = False
+                for ni in indices[0]:
+                    if ni not in visited:
+                        chain.append(ni)
+                        visited.add(ni)
+                        front = ni
+                        found = True
+                        break
+                if not found:
+                    break
 
-        # Step 4a: snap to the nearest Radon-detected angle within angle_tol
-        # Circular difference in [0, 180) wraps through 0°/180°
-        diffs = np.abs(((theta_degs - angle_deg + 90) % 180) - 90)
-        best = int(np.argmin(diffs))
-        if diffs[best] > tol:
-            labeled[start_idx] = True
-            continue
+            back = start_idx
+            for _ in range(chain_length - 1 - half):
+                _, indices = tree.query(pts[back].reshape(1, -1), k=num_neighbors + 1)
+                found = False
+                for ni in indices[0]:
+                    if ni not in visited:
+                        chain.appendleft(ni)
+                        visited.add(ni)
+                        back = ni
+                        found = True
+                        break
+                if not found:
+                    break
 
-        snapped_angle = theta_degs[best]
+            # Mark as selected regardless of snap outcome
+            selected[start_idx] = True
+            chain_pts = pts[list(chain)]
 
-        # Step 5: find all points within bin_width of the line through
-        # start_idx with the snapped orientation (perpendicular distance filter)
-        angle_rad = np.deg2rad(snapped_angle)
-        normal = np.array([-np.sin(angle_rad), np.cos(angle_rad)])
-        perp_dist = np.abs((pts - pts[start_idx]) @ normal)
-        near_idx = np.where(perp_dist <= bin_width)[0]  # sorted, start_idx always included
+            if len(chain) >= 2:
+                pca.fit(chain_pts)
+                direction = pca.components_[0]
+                angle_deg = np.degrees(np.arctan2(direction[1], direction[0])) % 180
 
-        # Step 6: BFS connected component from start_idx within the near-line
-        # set, using 2 * mean_dist as the adjacency radius to handle gaps
-        near_pts = pts[near_idx]
-        sub_tree = KDTree(near_pts)
-        start_local = int(np.searchsorted(near_idx, start_idx))
-        step_radius = mean_dist * 2.0
+                diffs = np.abs(((theta_degs - angle_deg + 90) % 180) - 90)
+                best = int(np.argmin(diffs))
 
-        subcluster_local = set()
-        queue = [start_local]
-        sub_seen = {start_local}
-        while queue:
-            cur = queue.pop(0)
-            subcluster_local.add(cur)
-            for ni in sub_tree.query_ball_point(near_pts[cur], r=step_radius):
-                if ni not in sub_seen:
-                    sub_seen.add(ni)
-                    queue.append(ni)
+                if diffs[best] <= tol:
+                    definitive_labels[start_idx] = best
+                    snapped_angle = theta_degs[best]
 
-        # Steps 7-8: assign the snapped angle label to every unlabeled point
-        # in the connected segment; already-labeled points keep their first label
-        subcluster_global = near_idx[list(subcluster_local)]
-        for idx in subcluster_global:
-            if not labeled[idx]:
-                labels[idx] = best
-                labeled[idx] = True
+                    # Perpendicular-distance filter — vectorised, no BFS
+                    angle_rad = np.deg2rad(snapped_angle)
+                    normal = np.array([-np.sin(angle_rad), np.cos(angle_rad)])
+                    perp_dist = np.abs((pts - pts[start_idx]) @ normal)
+                    near_idx = np.where(perp_dist <= bin_width)[0]
+
+                    # Cast one tentative vote on every near-line point
+                    tentative_votes[near_idx, best] += 1
+                    tentative_counts[near_idx] += 1
+
+            curr_satisfied = int(np.sum(selected | (tentative_counts >= min_tentative)))
+            pbar.update(curr_satisfied - prev_satisfied)
+            prev_satisfied = curr_satisfied
+
+    # Resolve final labels
+    labels = np.full(n_points, -1, dtype=int)
+    labels[selected] = definitive_labels[selected]
+    has_votes = (~selected) & (tentative_counts > 0)
+    if has_votes.any():
+        labels[has_votes] = np.argmax(tentative_votes[has_votes], axis=1)
 
     return labels, []
 
