@@ -5,7 +5,8 @@ from matplotlib import pyplot as plt
 from sklearn.decomposition import PCA
 from scipy.spatial import KDTree
 from scipy.signal import find_peaks, peak_widths
-from skimage.transform import radon
+from scipy.ndimage import maximum_filter, minimum_filter
+from skimage.transform import radon, iradon
 
 
 def compute_local_orientation(binary_image,
@@ -36,6 +37,7 @@ def compute_local_orientation(binary_image,
         Figure size ``(width, height)`` in inches when plotting.
         Default is ``(16, 8)``.
 
+
     Returns
     -------
     point_orientations : np.ndarray
@@ -52,7 +54,10 @@ def compute_local_orientation(binary_image,
         point_orientations, angle_info = orientation_via_radon(binary_image,
                                                                      kwargs.get('test_angles', None),
                                                                      kwargs.get('circle', True),
-                                                                     kwargs.get('tol', 5),
+                                                                     kwargs.get('angular_tolerance', 5),
+                                                                     kwargs.get('pixel_tolerance', 5),
+                                                                     kwargs.get('min_intensity', 0.05),
+                                                                     kwargs.get('do_offset', False),
                                                                      kwargs.get('precomputed_theta', None))
     else:
         raise ValueError(f"Invalid method: {method}. Must be one of the following: 'pca', 'radon'")
@@ -71,104 +76,448 @@ def compute_local_orientation(binary_image,
     return point_orientations, angle_info
 
 
-def orientation_via_probabilistic_line(binary_image,
-                                       chain_length: int = 20,
-                                       num_neighbors: int = 50):
+def orientation_via_radon(binary_image: np.ndarray,
+                                        test_angles: np.ndarray = None,
+                                        circle: bool = True,
+                                        angular_tolerance: int = 5,
+                                        pixel_tolerance: int = 5,
+                                        min_intensity: float = 0.05,
+                                        do_offset: bool = False,
+                                        precomputed_theta: dict = None) -> dict:
+    # tuple[float, np.ndarray]
+    """Find the dominant orientation of linear features using the Radon transform.
 
-    """Compute local orientation for each point in a binary image using probabilistic line
-
-    Steps:
-    1. randomly select point from the binarized image
-    2. compute the nearest neighbors according to the num_neighbors parameter
-    3. compute the mean distance between consecutive points in (2)
-    4. compute the angle_orientation and equation of line made by the points in (2) using PCA
-    5. compute all points lying within n_pixels of the line from (4)
-    6. create a subcluster of points in (5) starting from starting point (1) that is within distance computed in (3)
-    7. label all points in this subcluster having a local angle orientation of (4)
-    8. record all previous labels attached to a point
-    9. repeat steps 2-8 until all points are labeled
-    10. compute the average angle orientation of all points in the subcluster
+    Computes the Radon sinogram over ``test_angles`` and returns the angle whose
+    projection column has the highest variance. High variance indicates that
+    projections along that angle produce concentrated bright lines, which is
+    characteristic of linear features aligned with that orientation.
 
     Parameters
     ----------
-    binary_image : np.ndarray
-        Binary image where ``True`` values represent points of interest.
-    line_length : int, optional
-        Number of points to include in each local chain/subgroup. Default is 20.
-        More number leads to more accurate results, but also increases the
-        processing time.
-        Less number decreases processing time but makes the estimation vulnerable
-        to errors cause by non-linearly oriented features.
-    num_neighbors : int, optional
-        Number of nearest neighbours to query when extending/creating the local chain.
-        Higher values reduce the chance of getting stuck. Default is 50..
+    image : np.ndarray
+        Binary image containing linear features.
+    test_angles : np.ndarray, optional
+        Angles in degrees at which to compute the Radon transform. If ``None``,
+        180 angles uniformly spaced over ``[0°, 180°)`` are used.
+    circle : bool, optional
+        If ``True``, only pixels within the inscribed circle are projected
+        (matches the skimage default). Default is ``True``.
+    angular_tolerance : int | None, optional
+        Half-width in degrees of the suppression band around each angle in
+        ``remove_angles``. Default is 5.
+    pixel_tolerance : int | None, optional
+        minimum distance in pixels between two lines of the same family
+    min_intensity : float, optional
+        Minimum intensity of a pixel to be considered part of a linear feature.
+    do_offset: bool, optional
+        Set to 'True' if data has near vertical or horizontal features
+        to offset for better peak detection. Default is ``False``.
 
     Returns
     -------
-    point_orientations : np.ndarray
-        2-D float array of the same shape as ``binary_image``.  Each
-        foreground pixel carries its local orientation in degrees (wrapped
-        to ``[0, 180)``); background pixels are ``NaN``.
+    theta_info : dict
+        Dictionary with keys:
+
+        - ``'peaks'`` : np.ndarray of float — dominant angle(s) in degrees,
+          sorted by descending prominence.
+        - ``'widths_in_degrees'`` : np.ndarray of float — FWHM of each peak
+          in degrees.
+        - ``'profile_variance'`` : np.ndarray of float — variance profile
+          over all tested angles (rolled so index 0 corresponds to 0°).
 
     angle_profile: np.ndarray
-        histogram of the angle scores detected by 'pca'
+        histogram of the angle scores detected by 'radon'
     """
 
-    # Convert binary image to list of coordinates
-    X_linear = np.argwhere(binary_image)  # Extract coordinates of True values
+    X_linear = np.argwhere(binary_image)
+    x_coords = X_linear[:, 1]  # columns
+    y_coords = X_linear[:, 0]  # rows
+    if precomputed_theta is None:
+        if test_angles is None:
+            theta = np.linspace(0., 180., 180, endpoint=False)
+        else:
+            print(f"Using pre-computed angles: {precomputed_theta}")
+            theta = test_angles
 
-    # Create map to track labeled points
-    X_map = np.float32(binary_image) * np.nan
+        # Compute the Radon transform (sinogram) and the variance of each projection column
+        print("Computing Radon transform...")
+        sinogram = radon(binary_image, theta=theta, circle=circle)
+        profile_variance = np.var(sinogram, axis=0)
+        log_profile_variance = np.log1p(profile_variance)
 
-    # 1. Create a field of points
-    tree = KDTree(X_linear)
-    angle_scores = []
-    pca = PCA(n_components=1)
-
-    # continue until all points are labeled
-    while np.any(np.isnan(X_map)):
-        # 2. Parameters for the chain
-        start_idx = np.int(np.random.choice(np.where(~np.isnan(X_map))[0]))
-        chain = [start_idx]
-        visited = {start_idx}
-
-        # 3. The Chaining Logic
-        for _ in range(chain_length - 1):
-            current_pt = X_linear[chain[-1]].reshape(1, -1)
-
-            # We query more than 1 in case the absolute nearest is already in our chain
-            _, indices = tree.query(current_pt, k=num_neighbors)
-
-            found_next = False
-            for neighbor_idx in indices[0]:
-                if neighbor_idx not in visited:
-                    chain.append(neighbor_idx)
-                    visited.add(neighbor_idx)
-                    found_next = True
-                    break
-
-            if not found_next:
-                break
+        temp_offset = 0
+        if do_offset:
+            # data has near vertical or horizontal features,
+            # offset the profile variance to avoid peak detection issues
+            temp_offset = find_temp_offset(log_profile_variance)
+            print(f"Offsetting profile variance by {temp_offset} degrees for better peak detection.")
+            optimal_thetas = np.arange(temp_offset, temp_offset + 180)
+            sinogram = radon(binary_image, theta=optimal_thetas)
+            centered_profile_variance = np.var(sinogram, axis=0)
+            log_profile_variance = np.log1p(centered_profile_variance)
 
 
-        # Compute Local Orientation via PCA
-        pca.fit(X_linear[chain])
-        direction = pca.components_[0]
-        angle_radians = np.arctan2(direction[1], direction[0])  # atan2(y, x)
-        angle_scores.append(np.degrees(angle_radians))
+        detected_angles_radon, properties = find_peaks(log_profile_variance,
+                                                       distance=angular_tolerance*2,
+                                                       prominence=None)
 
-        # Find all points lying within n_pixels of the line
+        # if do_offset:
+        #     # If we offset the profile variance, we need to roll back the detected angles
+        #     detected_angles_radon = (detected_angles_radon + temp_offset) % 180
+        #     print(f"Corrected detected peaks (radon) after offset: {detected_angles_radon}")
 
 
-    angle_scores = np.array(angle_scores) - 90  # Shift angles by 90 degrees
-    angle_scores = angle_scores % 180  # Wrap angles to [0, 180)
+        # detected_angles_xy = (detected_angles_radon + 90) % 180
+        print(f"Detected peaks (radon):{detected_angles_radon}")
+        # print(f"Detected peaks (xy):{detected_angles_xy}")
+
+
+    else:
+        detected_angles_radon = precomputed_theta['peaks_radon']
+        detected_angles_xy = (detected_angles_radon + 90) % 180
+        print(f"Using pre-computed angles: {detected_angles_xy}")
+        profile_variance = precomputed_theta['profile_variance']
+        log_profile_variance = np.log1p(profile_variance)
+        sinogram = precomputed_theta['sinogram']
+
+    # Plot profile variance
+    plt.figure(figsize=(18, 8))
+    plt.imshow(1-sinogram, cmap="gray", aspect="auto")
+    plt.xlabel("Angle (degrees)")
+    plt.ylabel("r-distance (pixels)")
+    plt.title("Sinogram")
+
+
+    num_projections = sinogram.shape[0]
+    r_coords = np.arange(num_projections) - num_projections // 2
+    x_cols, y_rows = binary_image.shape[1], binary_image.shape[0]
+    x0, y0 = (x_cols - 1) / 2.0, (y_rows - 1) / 2.0
+
+    # 2D local maximum mask to prevent double-counting adjacent angles/pixels
+    neighborhood_size = (pixel_tolerance, 1)  # (s-radius, theta-radius)
+    local_max = maximum_filter(sinogram, size=neighborhood_size) == sinogram
+    # local_min = minimum_filter(sinogram, size=neighborhood_size) == sinogram
+    min_intensity = min_intensity * sinogram.mean()
+
+
+    colors = ["cyan", "magenta", "yellow", "lime", "orange", "red", "brown"]
+
+    print("Plotting peaks...")
+    for i, radon_angle in enumerate(detected_angles_radon):
+        # angle = (angle - 90) % 180
+        color = colors[i % len(colors)]
+
+        # if do_offset:
+            # If we offset the profile variance, we need to roll back the detected angles
+            # radon_angle = (radon_angle + temp_offset) % 180
+
+        # Define the angular range for this family
+        radon_theta_min = max(0, radon_angle - angular_tolerance)
+        radon_theta_max = min(179, radon_angle + angular_tolerance)
+        xy_theta_min = (radon_theta_min + 90 + temp_offset) % 180
+        xy_theta_max = (radon_theta_max + 90 + temp_offset) % 180
+
+        # Find 2D peak points inside this angular window
+        band_mask = np.zeros_like(sinogram, dtype=bool)
+        band_mask[:, radon_theta_min: radon_theta_max + 1] = True
+
+        # visualize lines under this band_mask
+        masked_sinogram = np.zeros_like(sinogram)
+        masked_sinogram[band_mask] = sinogram[band_mask]
+        print(f"Masked sinogram shape: {masked_sinogram.shape}, Original sinogram shape: {sinogram.shape}")
+
+        reconstructed = iradon(masked_sinogram, theta=np.arange(sinogram.shape[1]), filter_name="ramp")
+        print(f"Reconstructed shape: {reconstructed.shape}, Original shape: {binary_image.shape}")
+
+        rec_h, rec_w = reconstructed.shape
+        start_y = (rec_h - y_rows) // 2
+        start_x = (rec_w - x_cols) // 2
+        isolated_lines = reconstructed[
+            start_y: start_y + y_rows, start_x: start_x + x_cols
+        ]
+
+        # Normalize to [0, 1] for visualization
+        isolated_lines = np.clip(isolated_lines, 0, None)
+        if isolated_lines.max() > 0:
+            isolated_lines /= isolated_lines.max()
+
+        fig, axes = plt.subplots(3, 1, figsize=(15, 15))
+        # Original image
+        axes[0].imshow(1 - binary_image, cmap="gray")
+        axes[0].set_title("Original Image")
+
+        # Isolated lines from inverse Radon
+        axes[1].imshow(1 - isolated_lines, cmap="inferno")
+        axes[1].set_title(f"Isolated Band ({xy_theta_min}° - {xy_theta_max}°)")
+
+        # Thresholded overlay onto original
+        threshold = 0.3 * isolated_lines.max()
+        line_mask = isolated_lines > threshold
+
+        axes[2].imshow(1 - binary_image, cmap="gray")
+        # Plot detected lines in cyan with transparency
+        axes[2].imshow(
+            1 - np.ma.masked_where(~line_mask, line_mask),
+            cmap="cool",
+            alpha=0.6,
+            interpolation="none",
+        )
+        axes[2].set_title("Detected Lines Highlighted")
+
+        # for ax in axes:
+        #     ax.axis("off")
+
+
+        # Candidate peaks: must be local 2D maximum, above noise, and in angle band
+        peak_candidates = local_max & band_mask & (sinogram >= min_intensity)
+        s_indices, angle_sub_indices = np.where(peak_candidates)
+        first_line_of_family = True
+
+        xy_angle = (radon_angle + 90 + temp_offset) % 180
+        print(f"Plotting angle family {xy_angle}...")
+        fig, ax = plt.subplots(figsize=(9, 9))
+        ax.imshow(1 - binary_image, cmap="gray")
+        ax.set_title(f"Angle Family: {xy_angle}")
+
+        print(f"number of lines: {len(s_indices)} ")
+        for s_idx, a_idx in zip(s_indices, angle_sub_indices):
+            s_val = r_coords[s_idx]
+            actual_theta_deg = radon_angle + 90 + temp_offset
+            actual_theta_rad = np.deg2rad(actual_theta_deg)
+
+            cos_t = np.cos(actual_theta_rad)
+            sin_t = np.sin(actual_theta_rad)
+
+            # Intersect line: s = (x - x0)*cos(theta) + (y - y0)*sin(theta)
+            pts = []
+            if abs(sin_t) > 1e-4:
+                y_left = y0 + (s_val - (0 - x0) * cos_t) / sin_t
+                y_right = y0 + (s_val - (x_cols - 1 - x0) * cos_t) / sin_t
+                if 0 <= y_left < y_rows :
+                    pts.append((0, y_left))
+                if 0 <= y_right < y_rows :
+                    pts.append((y_rows - 1, y_right))
+
+            if abs(cos_t) > 1e-4:
+                x_top = x0 + (s_val - (0 - y0) * sin_t) / cos_t
+                x_bottom = x0 + (s_val - (y_rows - 1 - y0) * sin_t) / cos_t
+                if 0 <= x_top < x_cols:
+                    pts.append((x_top, 0))
+                if 0 <= x_bottom < x_cols:
+                    pts.append((x_bottom, x_cols - 1))
+
+            # Remove duplicate corner matches
+            unique_pts = []
+            for p in pts:
+                if not any(np.allclose(p, u, atol=1.0) for u in unique_pts):
+                    unique_pts.append(p)
+
+            if len(unique_pts) >= 2:
+                (x1, y1), (x2, y2) = unique_pts[0], unique_pts[1]
+                label_text = (
+                    f"Angle Family {xy_angle}° (±{angular_tolerance}°)"
+                    if first_line_of_family
+                    else ""
+                )
+                ax.plot(
+                    [y1, y2],
+                    [x1, x2],
+                    color=color,
+                    linewidth=1.75,
+                    alpha=0.9,
+                    label=label_text,
+                )
+                first_line_of_family = False
+    print("Labeling points...")
+    # labels, peak_centers_per_angle = label_points_by_probabilistic_line(x_coords,
+    #                                                        y_coords,
+    #                                                        peaks,
+    #                                                        bin_width=5.0,
+    #                                                        tol=tol,
+    #                                                        chain_length=10)
+    print("Labeling points... Done.")
+
+
+    # point_orientations = np.full_like(binary_image, fill_value=np.nan, dtype=np.float64)
+    # for i in range(len(labels)):
+    #     if labels[i] == -1:
+    #         continue
+    #     point_orientations[X_linear[i, 0], X_linear[i, 1]] = peaks[labels[i]]
+
+    theta_info = {
+        "peaks_xy": np.array(xy_angle),
+        "peaks_radon": np.array(detected_angles_radon),
+        "sinogram": sinogram,
+        "profile_variance": np.array(profile_variance),
+    }
+
     point_orientations = np.full_like(binary_image, fill_value=np.nan, dtype=np.float64)
-    point_orientations[X_linear[:, 0].astype(int),
-                       X_linear[:, 1].astype(int)] = angle_scores
-    angle_profile= np.histogram(point_orientations[~np.isnan(point_orientations)].flatten(),
-                                    bins=180)
 
-    return point_orientations, angle_profile
+    return point_orientations, theta_info
+
+
+def find_temp_offset(heights: list[float] | np.ndarray, rel_height: float = 1.0):
+    """
+    If data has near vertical or horizontal features, this function returns an offset computed from
+    the widest valley using inverted peak detection.
+
+    Parameters:
+    - heights: 1D array of histogram bin heights.
+    - rel_height: Relative height at which to evaluate width.
+                  1.0 measures at the full prominence base (the valley's natural rim).
+                  0.5 measures full-width at half-maximum (FWHM).
+
+    Returns:
+    - best_valley: Dict containing index of the trough, width, and bounding edges.
+    """
+    from scipy.signal import peak_widths
+
+    y = np.asarray(heights, dtype=float)
+    inv_y = -y  # Invert so troughs become peaks
+
+    # 1. Identify inverted peaks and compute their topological prominence
+    troughs, properties = find_peaks(inv_y, prominence=0)
+
+    if len(troughs) == 0:
+        return None
+
+    # 2. Compute widths at the chosen prominence level
+    # rel_height=1.0 measures width at the lowest contour line where the valley merges
+    widths, width_heights, left_ips, right_ips = peak_widths(
+        inv_y,
+        troughs
+        # rel_height=0
+    )
+
+    # 3. Find the index corresponding to the widest valley
+    widest_idx = np.argmax(widths)
+    angle_of_valley = int((left_ips[widest_idx] + right_ips[widest_idx]) / 2)
+
+    return angle_of_valley
+
+
+
+
+
+
+
+
+
+
+
+def orientation_via_probabilistic_line(binary_image: np.ndarray,
+                                        test_angles: np.ndarray = None,
+                                        circle: bool = True,
+                                        tol: int | None = 5,
+                                        precomputed_theta: dict = None) -> dict:
+    # tuple[float, np.ndarray]
+    """Find the dominant orientation of linear features using the Radon transform.
+
+    Computes the Radon sinogram over ``test_angles`` and returns the angle whose
+    projection column has the highest variance. High variance indicates that
+    projections along that angle produce concentrated bright lines, which is
+    characteristic of linear features aligned with that orientation.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        Binary image containing linear features.
+    test_angles : np.ndarray, optional
+        Angles in degrees at which to compute the Radon transform. If ``None``,
+        180 angles uniformly spaced over ``[0°, 180°)`` are used.
+    circle : bool, optional
+        If ``True``, only pixels within the inscribed circle are projected
+        (matches the skimage default). Default is ``True``.
+    tol : int | None, optional
+        Half-width in degrees of the suppression band around each angle in
+        ``remove_angles``. Default is 5.
+
+    Returns
+    -------
+    theta_info : dict
+        Dictionary with keys:
+
+        - ``'peaks'`` : np.ndarray of float — dominant angle(s) in degrees,
+          sorted by descending prominence.
+        - ``'widths_in_degrees'`` : np.ndarray of float — FWHM of each peak
+          in degrees.
+        - ``'profile_variance'`` : np.ndarray of float — variance profile
+          over all tested angles (rolled so index 0 corresponds to 0°).
+
+    angle_profile: np.ndarray
+        histogram of the angle scores detected by 'radon'
+    """
+
+    X_linear = np.argwhere(binary_image)
+    x_coords = X_linear[:, 1]  # columns
+    y_coords = X_linear[:, 0]  # rows
+    if precomputed_theta is None:
+        if test_angles is None:
+            theta = np.linspace(0., 180., 180, endpoint=False)
+        else:
+            print(f"Using pre-computed angles: {precomputed_theta}")
+            theta = test_angles
+
+        # Compute the Radon transform (sinogram) and the variance of each projection column
+        print("Computing Radon transform...")
+        sinogram = radon(binary_image, theta=theta, circle=circle)
+        profile_variance = np.var(sinogram, axis=0)
+        profile_variance_roll = np.roll(profile_variance, shift=90) % 180
+        log_profile_variance_roll = np.log1p(profile_variance_roll)
+        print("Radon Computation Done.")
+
+        # Plot profile variance
+        plt.figure(figsize=(10, 8))
+        plt.plot(profile_variance_roll, label="Profile Variance")
+        plt.xlabel("Angle (degrees)")
+        plt.ylabel("Variance")
+        plt.title("Variance Profile")
+        plt.figure(figsize=(10, 8))
+        plt.plot(log_profile_variance_roll, label="Log Profile Variance")
+        plt.xlabel("Angle (degrees)")
+        plt.ylabel("Log Variance")
+        plt.title("Variance Profile")
+
+        peaks, properties = find_peaks(log_profile_variance_roll, distance=tol*2, prominence=None)
+
+        print(f"Detected peaks:{peaks}")
+
+    else:
+        peaks = precomputed_theta['peaks']
+        profile_variance = precomputed_theta['profile_variance']
+
+    print("Labeling points...")
+    labels, peak_centers_per_angle = label_points_by_probabilistic_line(x_coords,
+                                                           y_coords,
+                                                           peaks,
+                                                           bin_width=5.0,
+                                                           tol=tol,
+                                                           chain_length=10)
+    print("Labeling points... Done.")
+
+
+    point_orientations = np.full_like(binary_image, fill_value=np.nan, dtype=np.float64)
+    for i in range(len(labels)):
+        if labels[i] == -1:
+            continue
+        point_orientations[X_linear[i, 0], X_linear[i, 1]] = peaks[labels[i]]
+
+    # # Deduct 90 degrees to remove effect of radon transform's 90-degree shift between image and sinogram angles
+    # peaks = (peaks - 90) % 180
+    #
+    # print(f"Detected peaks:{peaks}")
+    #
+    # # Adjust the profile variance (x-axis) to correspond with the correction above
+    # profile_variance = np.roll(profile_variance, len(theta) // 2)
+
+    theta_info = {
+        "peaks": np.array(peaks),
+        # "widths_in_degrees": np.array(widths_in_degrees),
+        "profile_variance": np.array(profile_variance),
+    }
+
+
+    return point_orientations, theta_info
 
 
 
@@ -255,142 +604,6 @@ def orientation_via_PCA(binary_image,
 
     return point_orientations, angle_profile
 
-
-def orientation_via_radon(binary_image: np.ndarray,
-                                        test_angles: np.ndarray = None,
-                                        circle: bool = True,
-                                        tol: int | None = 5,
-                                        precomputed_theta: dict = None) -> dict:
-    # tuple[float, np.ndarray]
-    """Find the dominant orientation of linear features using the Radon transform.
-
-    Computes the Radon sinogram over ``test_angles`` and returns the angle whose
-    projection column has the highest variance. High variance indicates that
-    projections along that angle produce concentrated bright lines, which is
-    characteristic of linear features aligned with that orientation.
-
-    Parameters
-    ----------
-    image : np.ndarray
-        Binary image containing linear features.
-    test_angles : np.ndarray, optional
-        Angles in degrees at which to compute the Radon transform. If ``None``,
-        180 angles uniformly spaced over ``[0°, 180°)`` are used.
-    circle : bool, optional
-        If ``True``, only pixels within the inscribed circle are projected
-        (matches the skimage default). Default is ``True``.
-    tol : int | None, optional
-        Half-width in degrees of the suppression band around each angle in
-        ``remove_angles``. Default is 5.
-
-    Returns
-    -------
-    theta_info : dict
-        Dictionary with keys:
-
-        - ``'peaks'`` : np.ndarray of float — dominant angle(s) in degrees,
-          sorted by descending prominence.
-        - ``'widths_in_degrees'`` : np.ndarray of float — FWHM of each peak
-          in degrees.
-        - ``'profile_variance'`` : np.ndarray of float — variance profile
-          over all tested angles (rolled so index 0 corresponds to 0°).
-
-    angle_profile: np.ndarray
-        histogram of the angle scores detected by 'radon'
-    """
-
-    X_linear = np.argwhere(binary_image)
-    x_coords = X_linear[:, 1]  # columns
-    y_coords = X_linear[:, 0]  # rows
-    if precomputed_theta is None:
-        if test_angles is None:
-            theta = np.linspace(0., 180., 180, endpoint=False)
-        else:
-            print(f"Using pre-computed angles: {precomputed_theta}")
-            theta = test_angles
-        angle_step = theta[1] - theta[0]
-
-        # Compute the Radon transform (sinogram) and the variance of each projection column
-        print("Computing Radon transform...")
-        sinogram = radon(binary_image, theta=theta, circle=circle)
-        profile_variance = np.var(sinogram, axis=0)
-        profile_variance_xy = np.roll(profile_variance, shift=90)
-        print("Radon Computation Done.")
-
-        # Plot profile variance
-        plt.figure(figsize=(10, 8))
-        plt.plot(profile_variance_xy, label="Profile Variance")
-        plt.xlabel("Angle (degrees)")
-        plt.ylabel("Variance")
-        plt.title("Variance Profile")
-        plt.figure(figsize=(10, 8))
-        plt.plot(np.log1p(profile_variance), label="Log Profile Variance")
-        plt.xlabel("Angle (degrees)")
-        plt.ylabel("Variance")
-        plt.title("Variance Profile")
-
-
-        # Detect peaks in the variance profile
-        # rough estimate: foreground_points / expected_tracklines_per_angle
-        # min_peak_prominence = len(x_coords) // (n_angles * expected_lines_per_angle)
-        peaks, properties = find_peaks(profile_variance_xy, distance=tol*2, prominence=None)
-
-        print(f"Detected peaks:{peaks}")
-        # print(f"Properties: {properties}")
-
-        # widths, _, _, _ = peak_widths(profile_variance, peaks, rel_height=0.5)
-        # widths_in_degrees = widths * angle_step
-        #
-        # # sort the peaks by variance and return the most dominant angle and its width
-        # peak_indices = np.argsort(np.array(profile_variance[peaks]))[::-1]
-        # peaks = peaks[peak_indices]
-    else:
-        peaks = precomputed_theta['peaks']
-        profile_variance = precomputed_theta['profile_variance']
-
-    # tol: use at least half the FWHM of the widest detected peak
-    # if tol is None:
-    #     tol = int(np.ceil(np.max(widths_in_degrees) / 2))
-    # else:
-    #     tol = max(tol/2, int(np.ceil(np.max(widths_in_degrees) / 2)))
-    # print(f"Using tolerance: {tol}")
-
-    # Convert peaks to rho-space
-    # peaks = (peaks + 90 ) % 180
-    # print(f"Converted peaks to rho-space: {peaks}")
-
-    print("Labeling points...")
-    labels, peak_centers_per_angle = label_points_by_probabilistic_line(x_coords,
-                                                           y_coords,
-                                                           peaks,
-                                                           bin_width=5.0,
-                                                           tol=tol,
-                                                           chain_length=10)
-    print("Labeling points... Done.")
-
-
-    point_orientations = np.full_like(binary_image, fill_value=np.nan, dtype=np.float64)
-    for i in range(len(labels)):
-        if labels[i] == -1:
-            continue
-        point_orientations[X_linear[i, 0], X_linear[i, 1]] = peaks[labels[i]]
-
-    # # Deduct 90 degrees to remove effect of radon transform's 90-degree shift between image and sinogram angles
-    # peaks = (peaks - 90) % 180
-    #
-    # print(f"Detected peaks:{peaks}")
-    #
-    # # Adjust the profile variance (x-axis) to correspond with the correction above
-    # profile_variance = np.roll(profile_variance, len(theta) // 2)
-
-    theta_info = {
-        "peaks": np.array(peaks),
-        # "widths_in_degrees": np.array(widths_in_degrees),
-        "profile_variance": np.array(profile_variance),
-    }
-
-
-    return point_orientations, theta_info
 
 def label_points_by_angle(x,
                           y,
