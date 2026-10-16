@@ -5,8 +5,9 @@ from matplotlib import pyplot as plt
 from sklearn.decomposition import PCA
 from scipy.spatial import KDTree
 from scipy.signal import find_peaks, peak_widths
-from scipy.ndimage import maximum_filter, minimum_filter
+from scipy.ndimage import maximum_filter, zoom, distance_transform_edt
 from skimage.transform import radon, iradon
+import time
 
 
 def compute_local_orientation(binary_image,
@@ -53,12 +54,13 @@ def compute_local_orientation(binary_image,
     elif method == 'radon':
         point_orientations, angle_info = orientation_via_radon(binary_image,
                                                                      kwargs.get('test_angles', None),
-                                                                     kwargs.get('circle', True),
+                                                                     kwargs.get('circle', False),
                                                                      kwargs.get('angular_tolerance', 5),
                                                                      kwargs.get('pixel_tolerance', 5),
                                                                      kwargs.get('min_intensity', 0.05),
                                                                      kwargs.get('do_offset', False),
-                                                                     kwargs.get('precomputed_theta', None))
+                                                                     kwargs.get('precomputed_theta', None),
+                                                                     kwargs.get('zoom_factor', 2.0))
     else:
         raise ValueError(f"Invalid method: {method}. Must be one of the following: 'pca', 'radon'")
 
@@ -76,14 +78,78 @@ def compute_local_orientation(binary_image,
     return point_orientations, angle_info
 
 
+def _radon_center(shape, circle):
+    """Pixel ``(row, col)`` of ``shape`` that skimage's radon/iradon treat as the rotation centre.
+
+    With ``circle=False`` the image is padded symmetrically about ``shape // 2``.
+    With ``circle=True`` it is first cropped to a centred square whose start
+    offset is rounded up, which shifts the centre by one pixel on odd excess.
+    """
+    h, w = shape
+    if not circle:
+        return h // 2, w // 2
+    m = min(h, w)
+    return int(np.ceil((h - m) / 2)) + m // 2, int(np.ceil((w - m) / 2)) + m // 2
+
+
+def _align_reconstruction(reconstructed, shape, circle):
+    """Place an ``iradon`` output onto a canvas of ``shape`` so pixels overlay the original image.
+
+    The reconstruction can be larger (``circle=False``) or smaller
+    (``circle=True``) than the original; pixels with no counterpart are 0.
+    """
+    h, w = shape
+    rh, rw = reconstructed.shape
+    cy, cx = _radon_center(shape, circle)
+    oy, ox = cy - rh // 2, cx - rw // 2  # reconstructed (r, c) -> image (r + oy, c + ox)
+    aligned = np.zeros(shape, dtype=reconstructed.dtype)
+    r0, c0 = max(0, oy), max(0, ox)
+    r1, c1 = min(h, oy + rh), min(w, ox + rw)
+    aligned[r0:r1, c0:c1] = reconstructed[r0 - oy:r1 - oy, c0 - ox:c1 - ox]
+    return aligned
+
+
+def _radon_line_endpoints(s_val, theta_deg, center, shape):
+    """Return the two ``(x, y)`` points where the Radon line ``(s, theta)`` crosses the image border.
+
+    skimage's projection offset is ``s = (x - cx)·cos(θ) − (y - cy)·sin(θ)``
+    with ``θ`` the Radon angle in degrees and ``(cy, cx)`` from ``_radon_center``.
+    Returns ``None`` if the line does not cross the image.
+    """
+    cy, cx = center
+    h, w = shape
+    t = np.deg2rad(theta_deg)
+    cos_t, sin_t = np.cos(t), np.sin(t)
+
+    pts = []
+    if abs(sin_t) > 1e-6:
+        for x in (0, w - 1):
+            y = cy + ((x - cx) * cos_t - s_val) / sin_t
+            if 0 <= y <= h - 1:
+                pts.append((x, y))
+    if abs(cos_t) > 1e-6:
+        for y in (0, h - 1):
+            x = cx + (s_val + (y - cy) * sin_t) / cos_t
+            if 0 <= x <= w - 1:
+                pts.append((x, y))
+
+    # Remove duplicate corner matches
+    unique_pts = []
+    for p in pts:
+        if not any(np.allclose(p, u, atol=1.0) for u in unique_pts):
+            unique_pts.append(p)
+    return unique_pts[:2] if len(unique_pts) >= 2 else None
+
+
 def orientation_via_radon(binary_image: np.ndarray,
                                         test_angles: np.ndarray = None,
-                                        circle: bool = True,
+                                        circle: bool = False,
                                         angular_tolerance: int = 5,
                                         pixel_tolerance: int = 5,
                                         min_intensity: float = 0.05,
                                         do_offset: bool = False,
-                                        precomputed_theta: dict = None) -> dict:
+                                        precomputed_theta: dict = None,
+                                        zoom_factor: float = 2.0) -> dict:
     # tuple[float, np.ndarray]
     """Find the dominant orientation of linear features using the Radon transform.
 
@@ -100,8 +166,9 @@ def orientation_via_radon(binary_image: np.ndarray,
         Angles in degrees at which to compute the Radon transform. If ``None``,
         180 angles uniformly spaced over ``[0°, 180°)`` are used.
     circle : bool, optional
-        If ``True``, only pixels within the inscribed circle are projected
-        (matches the skimage default). Default is ``True``.
+        If ``True``, only pixels within the circle inscribed in the central
+        square are projected — on a rectangular raster everything outside that
+        square is discarded. Default is ``False`` (whole image is used).
     angular_tolerance : int | None, optional
         Half-width in degrees of the suppression band around each angle in
         ``remove_angles``. Default is 5.
@@ -129,9 +196,38 @@ def orientation_via_radon(binary_image: np.ndarray,
         histogram of the angle scores detected by 'radon'
     """
 
-    X_linear = np.argwhere(binary_image)
-    x_coords = X_linear[:, 1]  # columns
-    y_coords = X_linear[:, 0]  # rows
+    min_row = np.argwhere(binary_image)[:, 0].min()
+    max_row = np.argwhere(binary_image)[:, 0].max()
+    min_col = np.argwhere(binary_image)[:, 1].min()
+    max_col = np.argwhere(binary_image)[:, 1].max()
+    sub_image = binary_image[min_row:max_row + 1, min_col:max_col + 1]
+    # # EDT measures the distance from each nonzero pixel to the nearest zero pixel,
+    # # so invert the mask: background becomes nonzero, foreground (lines) becomes 0.
+    # # Result: each background pixel -> distance (pixels) to the nearest foreground pixel.
+    # sub_image_edt = distance_transform_edt(~sub_image.astype(bool))
+    #
+    # #Plot the distance transform
+    # plt.figure(figsize=(10, 8))
+    # plt.imshow(sub_image_edt, cmap='viridis')
+    # plt.colorbar(label='Distance to nearest foreground pixel (pixels)')
+    # plt.title('Distance Transform')
+    # plt.show()
+    #
+    # # Plot the histogram of the distance transform
+    # plt.figure(figsize=(10, 8))
+    # log_distance_edt = np.log1p(sub_image_edt.ravel())
+    # plt.hist(log_distance_edt, bins=50, color='blue', alpha=0.7)
+    # plt.title('Histogram of Distance Transform Values')
+    # plt.xlabel('Log Distance to nearest background pixel')
+    # plt.ylabel('Frequency')
+    # plt.show()
+
+
+
+    zoom_factor = zoom_factor
+    sub_rows, sub_cols = sub_image.shape
+    input_image = zoom(sub_image, zoom=1/zoom_factor, order=0)
+    theta = []
     if precomputed_theta is None:
         if test_angles is None:
             theta = np.linspace(0., 180., 180, endpoint=False)
@@ -140,8 +236,15 @@ def orientation_via_radon(binary_image: np.ndarray,
             theta = test_angles
 
         # Compute the Radon transform (sinogram) and the variance of each projection column
-        print("Computing Radon transform...")
-        sinogram = radon(binary_image, theta=theta, circle=circle)
+        print("Computing initial Radon transform...", end=" ")
+        start_time = time.perf_counter()
+        sinogram = radon(input_image, theta=theta, circle=circle)
+        print("Done.")
+        end_time = time.perf_counter()
+        execution_time = end_time - start_time
+        print(f"Radon transform execution time: {execution_time:.4f} seconds")
+
+
         profile_variance = np.var(sinogram, axis=0)
         log_profile_variance = np.log1p(profile_variance)
 
@@ -149,22 +252,70 @@ def orientation_via_radon(binary_image: np.ndarray,
         if do_offset:
             # data has near vertical or horizontal features,
             # offset the profile variance to avoid peak detection issues
+
+            start_time = time.perf_counter()
             temp_offset = find_temp_offset(log_profile_variance)
+            end_time = time.perf_counter()
+            execution_time = end_time - start_time
+            print(f"Offset computation execution time: {execution_time:.4f} seconds")
+
             print(f"Offsetting profile variance by {temp_offset} degrees for better peak detection.")
             optimal_thetas = np.arange(temp_offset, temp_offset + 180)
-            sinogram = radon(binary_image, theta=optimal_thetas)
+            print("Computing Radon transform with offset...", end=" ")
+            start_time = time.perf_counter()
+            sinogram = radon(input_image, theta=optimal_thetas, circle=circle)
+            end_time = time.perf_counter()
+            execution_time = end_time - start_time
+            print(f"Second Radon computation execution time: {execution_time:.4f} seconds")
+            print("Done.")
+
+
             centered_profile_variance = np.var(sinogram, axis=0)
+
+            # # Plot before and after offsetting
+            # plt.figure(figsize=(10, 8))
+            # plt.plot(log_profile_variance, label="Original Log Profile Variance")
+            # plt.plot(np.roll(np.log1p(centered_profile_variance), -temp_offset), label="Offset Log Profile Variance")
+            # plt.xlabel("Angle (degrees)")
+            # plt.ylabel("Log Profile Variance")
+            # plt.title("Offsetting Profile Variance")
+            # plt.legend()
+            # plt.show()
+            #
+            # plt.figure(figsize=(10, 8))
+            # plt.plot(profile_variance, label="Original Profile Variance")
+            # plt.plot(np.roll(centered_profile_variance, -temp_offset), label="Offset Profile Variance")
+            # plt.xlabel("Angle (degrees)")
+            # plt.ylabel("Profile Variance")
+            # plt.title("Offsetting Profile Variance")
+            # plt.legend()
+            # plt.show()
+
+
             log_profile_variance = np.log1p(centered_profile_variance)
+            theta = optimal_thetas
+        else:
+            plt.figure(figsize=(10, 8))
+            plt.plot(log_profile_variance, label="Original Log Profile Variance")
+            plt.xlabel("Angle (degrees)")
+            plt.ylabel("Log Profile Variance")
+            plt.title("Offsetting Profile Variance")
+            plt.legend()
+            plt.show()
+            # # Plot the offset profile variance
+            # plt.figure(figsize=(10, 8))
+            # plt.plot(log_profile_variance, label="Offset Log Profile Variance")
+            # plt.xlabel("Angle (degrees)")
+            # plt.ylabel("Log Profile Variance")
+            # plt.title("Offsetting Profile Variance")
+            # plt.legend()
+            # plt.show()
 
-
+        print("Detecting peaks in the log profile variance...", end=" ")
         detected_angles_radon, properties = find_peaks(log_profile_variance,
                                                        distance=angular_tolerance*2,
                                                        prominence=None)
-
-        # if do_offset:
-        #     # If we offset the profile variance, we need to roll back the detected angles
-        #     detected_angles_radon = (detected_angles_radon + temp_offset) % 180
-        #     print(f"Corrected detected peaks (radon) after offset: {detected_angles_radon}")
+        print("Done.")
 
 
         # detected_angles_xy = (detected_angles_radon + 90) % 180
@@ -179,19 +330,24 @@ def orientation_via_radon(binary_image: np.ndarray,
         profile_variance = precomputed_theta['profile_variance']
         log_profile_variance = np.log1p(profile_variance)
         sinogram = precomputed_theta['sinogram']
+        # Radon angle (degrees) of each sinogram column
+        theta = precomputed_theta.get('theta', np.arange(sinogram.shape[1]))
 
-    # Plot profile variance
-    plt.figure(figsize=(18, 8))
-    plt.imshow(1-sinogram, cmap="gray", aspect="auto")
-    plt.xlabel("Angle (degrees)")
-    plt.ylabel("r-distance (pixels)")
-    plt.title("Sinogram")
+    theta = np.asarray(theta, dtype=float)
+
+    # # Plot profile variance
+    # plt.figure(figsize=(18, 8))
+    # plt.imshow(1-sinogram, cmap="gray", aspect="auto")
+    # plt.xlabel("Angle (degrees)")
+    # plt.ylabel("r-distance (pixels)")
+    # plt.title("Sinogram")
 
 
     num_projections = sinogram.shape[0]
     r_coords = np.arange(num_projections) - num_projections // 2
-    x_cols, y_rows = binary_image.shape[1], binary_image.shape[0]
-    x0, y0 = (x_cols - 1) / 2.0, (y_rows - 1) / 2.0
+    x_cols, y_rows = input_image.shape[1], input_image.shape[0]
+    radon_center = _radon_center(input_image.shape, circle)
+    peaks_xy = []
 
     # 2D local maximum mask to prevent double-counting adjacent angles/pixels
     neighborhood_size = (pixel_tolerance, 1)  # (s-radius, theta-radius)
@@ -203,6 +359,7 @@ def orientation_via_radon(binary_image: np.ndarray,
     colors = ["cyan", "magenta", "yellow", "lime", "orange", "red", "brown"]
 
     print("Plotting peaks...")
+    angle_dict = {}
     for i, radon_angle in enumerate(detected_angles_radon):
         # angle = (angle - 90) % 180
         color = colors[i % len(colors)]
@@ -211,11 +368,9 @@ def orientation_via_radon(binary_image: np.ndarray,
             # If we offset the profile variance, we need to roll back the detected angles
             # radon_angle = (radon_angle + temp_offset) % 180
 
-        # Define the angular range for this family
+        # Define the angular range for this family (sinogram column indices)
         radon_theta_min = max(0, radon_angle - angular_tolerance)
-        radon_theta_max = min(179, radon_angle + angular_tolerance)
-        xy_theta_min = (radon_theta_min + 90 + temp_offset) % 180
-        xy_theta_max = (radon_theta_max + 90 + temp_offset) % 180
+        radon_theta_max = min(sinogram.shape[1] - 1, radon_angle + angular_tolerance)
 
         # Find 2D peak points inside this angular window
         band_mask = np.zeros_like(sinogram, dtype=bool)
@@ -224,118 +379,124 @@ def orientation_via_radon(binary_image: np.ndarray,
         # visualize lines under this band_mask
         masked_sinogram = np.zeros_like(sinogram)
         masked_sinogram[band_mask] = sinogram[band_mask]
-        print(f"Masked sinogram shape: {masked_sinogram.shape}, Original sinogram shape: {sinogram.shape}")
 
-        reconstructed = iradon(masked_sinogram, theta=np.arange(sinogram.shape[1]), filter_name="ramp")
-        print(f"Reconstructed shape: {reconstructed.shape}, Original shape: {binary_image.shape}")
+        # circle must match the forward radon call, otherwise iradon assumes a
+        # different geometry and returns a min(H, W) square
+        iradon_kwargs = {} if circle else {"output_size": max(y_rows, x_cols)}
+        print("Reconstructing image from masked sinogram...", end=" ")
+        start_time = time.perf_counter()
+        reconstructed = iradon(masked_sinogram, theta=theta, filter_name="ramp",
+                               circle=circle, **iradon_kwargs)
+        end_time = time.perf_counter()
+        execution_time = end_time - start_time
+        print(f"Done. Reconstruction execution time: {execution_time:.4f} seconds")
 
-        rec_h, rec_w = reconstructed.shape
-        start_y = (rec_h - y_rows) // 2
-        start_x = (rec_w - x_cols) // 2
-        isolated_lines = reconstructed[
-            start_y: start_y + y_rows, start_x: start_x + x_cols
-        ]
+        isolated_lines = _align_reconstruction(reconstructed, input_image.shape, circle)
 
         # Normalize to [0, 1] for visualization
         isolated_lines = np.clip(isolated_lines, 0, None)
         if isolated_lines.max() > 0:
             isolated_lines /= isolated_lines.max()
 
-        fig, axes = plt.subplots(3, 1, figsize=(15, 15))
-        # Original image
-        axes[0].imshow(1 - binary_image, cmap="gray")
-        axes[0].set_title("Original Image")
-
-        # Isolated lines from inverse Radon
-        axes[1].imshow(1 - isolated_lines, cmap="inferno")
-        axes[1].set_title(f"Isolated Band ({xy_theta_min}° - {xy_theta_max}°)")
+        # fig, axes = plt.subplots(2, 1, figsize=(15, 15))
+        # # Original image
+        # axes[0].imshow(1 - binary_image, cmap="gray")
+        # axes[0].set_title("Original Image")
 
         # Thresholded overlay onto original
         threshold = 0.3 * isolated_lines.max()
         line_mask = isolated_lines > threshold
+        line_mask = zoom(line_mask, zoom=zoom_factor, order=0)
+        line_mask = line_mask.astype(bool)
+        # Add or remove padding to match the sub_image size
+        if line_mask.shape[0] < sub_image.shape[0]:
+            pad_height = sub_image.shape[0] - line_mask.shape[0]
+            line_mask = np.pad(line_mask, ((0, pad_height), (0, 0)), mode='constant', constant_values=False)
+        elif line_mask.shape[0] > sub_image.shape[0]:
+            line_mask = line_mask[:sub_image.shape[0], :]
+        if line_mask.shape[1] < sub_image.shape[1]:
+            pad_width = sub_image.shape[1] - line_mask.shape[1]
+            line_mask = np.pad(line_mask, ((0, 0), (0, pad_width)), mode='constant', constant_values=False)
+        elif line_mask.shape[1] > sub_image.shape[1]:
+            line_mask = line_mask[:, :sub_image.shape[1]]
 
-        axes[2].imshow(1 - binary_image, cmap="gray")
-        # Plot detected lines in cyan with transparency
-        axes[2].imshow(
-            1 - np.ma.masked_where(~line_mask, line_mask),
-            cmap="cool",
-            alpha=0.6,
-            interpolation="none",
-        )
-        axes[2].set_title("Detected Lines Highlighted")
+        # Pad the line_mask to match the original image size
+        padded_line_mask = np.zeros_like(binary_image, dtype=bool)
+        padded_line_mask[min_row:max_row + 1, min_col:max_col + 1] = line_mask
+
+        # Isolated lines from inverse Radon
+        plt.figure(figsize=(10, 8))
+        plt.imshow(1 - padded_line_mask, cmap="gray")
+
+        # xy_theta_min = (theta[radon_theta_min] + 90) % 180
+        # xy_theta_max = (theta[radon_theta_max] + 90) % 180
+        xy_theta = (radon_angle - 90 + temp_offset) % 180
+        plt.title(f"Isolated Band ({xy_theta})°)")
+
+        angle_dict[xy_theta] = padded_line_mask
+
+
+
+        # # Detected lines
+        # axes[2].imshow(1 - binary_image, cmap="gray")
+        # # Plot detected lines in cyan with transparency
+        # axes[2].imshow(
+        #     1 - line_mask,
+        #     cmap="cool",
+        #     alpha=0.3,
+        #     interpolation="none",
+        # )
+        # axes[2].set_title("Detected Lines Highlighted")
 
         # for ax in axes:
         #     ax.axis("off")
 
 
-        # Candidate peaks: must be local 2D maximum, above noise, and in angle band
-        peak_candidates = local_max & band_mask & (sinogram >= min_intensity)
-        s_indices, angle_sub_indices = np.where(peak_candidates)
-        first_line_of_family = True
+        # # Candidate peaks: must be local 2D maximum, above noise, and in angle band
+        # peak_candidates = local_max & band_mask & (sinogram >= min_intensity)
+        # s_indices, angle_sub_indices = np.where(peak_candidates)
+        # first_line_of_family = True
+        #
+        # xy_angle = (theta[radon_angle] + 90) % 180
+        # peaks_xy.append(xy_angle)
+        # print(f"Plotting angle family {xy_angle}...")
+        # fig, ax = plt.subplots(figsize=(9, 9))
+        # ax.imshow(1 - input_image, cmap="gray")
+        # ax.set_title(f"Angle Family: {xy_angle}")
 
-        xy_angle = (radon_angle + 90 + temp_offset) % 180
-        print(f"Plotting angle family {xy_angle}...")
-        fig, ax = plt.subplots(figsize=(9, 9))
-        ax.imshow(1 - binary_image, cmap="gray")
-        ax.set_title(f"Angle Family: {xy_angle}")
-
-        print(f"number of lines: {len(s_indices)} ")
-        for s_idx, a_idx in zip(s_indices, angle_sub_indices):
-            s_val = r_coords[s_idx]
-            actual_theta_deg = radon_angle + 90 + temp_offset
-            actual_theta_rad = np.deg2rad(actual_theta_deg)
-
-            cos_t = np.cos(actual_theta_rad)
-            sin_t = np.sin(actual_theta_rad)
-
-            # Intersect line: s = (x - x0)*cos(theta) + (y - y0)*sin(theta)
-            pts = []
-            if abs(sin_t) > 1e-4:
-                y_left = y0 + (s_val - (0 - x0) * cos_t) / sin_t
-                y_right = y0 + (s_val - (x_cols - 1 - x0) * cos_t) / sin_t
-                if 0 <= y_left < y_rows :
-                    pts.append((0, y_left))
-                if 0 <= y_right < y_rows :
-                    pts.append((y_rows - 1, y_right))
-
-            if abs(cos_t) > 1e-4:
-                x_top = x0 + (s_val - (0 - y0) * sin_t) / cos_t
-                x_bottom = x0 + (s_val - (y_rows - 1 - y0) * sin_t) / cos_t
-                if 0 <= x_top < x_cols:
-                    pts.append((x_top, 0))
-                if 0 <= x_bottom < x_cols:
-                    pts.append((x_bottom, x_cols - 1))
-
-            # Remove duplicate corner matches
-            unique_pts = []
-            for p in pts:
-                if not any(np.allclose(p, u, atol=1.0) for u in unique_pts):
-                    unique_pts.append(p)
-
-            if len(unique_pts) >= 2:
-                (x1, y1), (x2, y2) = unique_pts[0], unique_pts[1]
-                label_text = (
-                    f"Angle Family {xy_angle}° (±{angular_tolerance}°)"
-                    if first_line_of_family
-                    else ""
-                )
-                ax.plot(
-                    [y1, y2],
-                    [x1, x2],
-                    color=color,
-                    linewidth=1.75,
-                    alpha=0.9,
-                    label=label_text,
-                )
-                first_line_of_family = False
-    print("Labeling points...")
+        # print(f"number of lines: {len(s_indices)} ")
+        #
+        # for s_idx, a_idx in zip(s_indices, angle_sub_indices):
+        #     s_val = r_coords[s_idx]
+        #     # Use the column where this line actually peaks, not the family centre
+        #     xy_theta = (theta[a_idx] - 90 - temp_offset) % 180.0
+        #     endpoints = _radon_line_endpoints(s_val, xy_theta, radon_center, binary_image.shape)
+        #     # endpoints = _radon_line_endpoints(s_val, xy_angle, radon_center, binary_image.shape)
+        #
+        #     if endpoints is not None:
+        #         (x1, y1), (x2, y2) = endpoints
+        #         label_text = (
+        #             f"Angle Family {xy_angle}° (±{angular_tolerance}°)"
+        #             if first_line_of_family
+        #             else ""
+        #         )
+        #         ax.plot(
+        #             [x1, x2],
+        #             [y1, y2],
+        #             color=color,
+        #             linewidth=1.75,
+        #             alpha=0.9,
+        #             label=label_text,
+        #         )
+        #         first_line_of_family = False
+    # print("Labeling points...")
     # labels, peak_centers_per_angle = label_points_by_probabilistic_line(x_coords,
     #                                                        y_coords,
     #                                                        peaks,
     #                                                        bin_width=5.0,
     #                                                        tol=tol,
     #                                                        chain_length=10)
-    print("Labeling points... Done.")
+    # print("Labeling points... Done.")
 
 
     # point_orientations = np.full_like(binary_image, fill_value=np.nan, dtype=np.float64)
@@ -344,14 +505,17 @@ def orientation_via_radon(binary_image: np.ndarray,
     #         continue
     #     point_orientations[X_linear[i, 0], X_linear[i, 1]] = peaks[labels[i]]
 
-    theta_info = {
-        "peaks_xy": np.array(xy_angle),
-        "peaks_radon": np.array(detected_angles_radon),
-        "sinogram": sinogram,
-        "profile_variance": np.array(profile_variance),
-    }
+    # theta_info = {
+    #     "peaks_xy": np.array(peaks_xy),
+    #     "peaks_radon": np.array(detected_angles_radon),
+    #     "theta": theta,
+    #     "sinogram": sinogram,
+    #     "profile_variance": np.array(profile_variance),
+    # }
 
-    point_orientations = np.full_like(binary_image, fill_value=np.nan, dtype=np.float64)
+    # theta_info = profile_variance
+    theta_info = []
+    point_orientations = angle_dict
 
     return point_orientations, theta_info
 
@@ -378,6 +542,7 @@ def find_temp_offset(heights: list[float] | np.ndarray, rel_height: float = 1.0)
     # 1. Identify inverted peaks and compute their topological prominence
     troughs, properties = find_peaks(inv_y, prominence=0)
 
+
     if len(troughs) == 0:
         return None
 
@@ -388,6 +553,7 @@ def find_temp_offset(heights: list[float] | np.ndarray, rel_height: float = 1.0)
         troughs
         # rel_height=0
     )
+
 
     # 3. Find the index corresponding to the widest valley
     widest_idx = np.argmax(widths)
