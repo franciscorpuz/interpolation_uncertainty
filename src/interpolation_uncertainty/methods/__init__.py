@@ -174,7 +174,7 @@ for _m in _SPECTRAL_METHODS:
     _REGISTRY[_m] = functools.partial(spectral_estimator, method=_m)
 
 # Backward-compatible alias used by the package root __init__.py and notebooks
-compute_uncertainty = spectral_estimator
+# compute_uncertainty = spectral_estimator
 
 
 # ---------------------------------------------------------------------------
@@ -184,8 +184,8 @@ compute_uncertainty = spectral_estimator
 from .statistical import statistical_estimator  # noqa: E402
 
 _STATISTICAL_METHODS = ('sar', 'ser', 'smr')
-for _m in _SPECTRAL_METHODS:
+for _m in _STATISTICAL_METHODS:
     _REGISTRY[_m] = functools.partial(statistical_estimator, method=_m)
 
 # Backward-compatible alias used by the package root __init__.py and notebooks
-compute_uncertainty = statistical_estimator
+# compute_uncertainty = statistical_estimator`

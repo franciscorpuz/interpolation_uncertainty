@@ -4,6 +4,7 @@ from scipy.spatial import cKDTree
 from skimage.transform import rotate
 from skimage.morphology import remove_small_objects
 from skimage.measure import label, regionprops
+from matplotlib import pyplot as plt
 
 
 def detect_trackline_positions(
@@ -65,48 +66,80 @@ def detect_trackline_positions(
         detected peak.  Try increasing ``band_width`` or lowering
         ``min_line_factor``.
     """
+
     angle_to_rotate = 90.0 - angle
 
-    rotated_mask  = rotate(angle_mask.astype(float),
+    # # Plot the original angle mask for debugging
+    # plt.figure(figsize=(10, 8))
+    # plt.imshow(1 - angle_mask, cmap='gray')
+    # plt.title(f"Original Angle Mask (Angle: {angle:.2f}°)")
+    # plt.show()
+    #
+    # print(f"Angle values: {np.unique(angle_mask)}")
+
+    angle_binary = angle_mask.copy()
+    angle_binary[~np.isnan(angle_binary)] = 1
+    angle_binary[np.isnan(angle_binary)] = 0
+
+    rotated_mask  = rotate(angle_binary,
                            angle=angle_to_rotate, resize=True,
-                           preserve_range=True, order=0).astype(bool)
-    rotated_bathy = rotate(bathy_binary.astype(float),
-                           angle=angle_to_rotate, resize=True,
-                           preserve_range=True, order=0).astype(bool)
+                           preserve_range=True, order=0)
+    rotated_mask = (rotated_mask > 0.5).astype(bool)  # Convert to boolean mask
+
+    # rotated_bathy = rotate(bathy_binary,
+    #                        angle=angle_to_rotate, resize=True,
+    #                        preserve_range=True, order=0).astype(bool)
+
+    # # Plot rotated mask for debugging
+    # plt.figure(figsize=(10, 8))
+    # plt.imshow(1 - rotated_mask, cmap='gray')
+    # plt.title(f"Rotated Angle Mask (Angle: {angle:.2f}°, Rotation: {angle_to_rotate:.2f}°)")
+    # plt.show()
 
     # Column projection — each column's sum counts skeleton pixels belonging
     # to a line at that x-position in the rotated frame
     projection      = np.sum(rotated_mask, axis=0)
-    min_line_length = int(np.max(projection) * min_line_factor)
+    # min_line_length = int(np.max(projection) * min_line_factor)
 
     peaks, properties = find_peaks(
         projection,
-        height=min_line_length,
-        distance=band_width,
-        prominence=min_line_length,
+        distance=band_width
     )
 
-    # Stamp each peak column with all valid bathy rows inside its base window
-    # so every detected line is exactly 1 pixel wide at the peak position
-    line_mask = np.zeros_like(rotated_bathy, dtype=bool)
-    for idx, peak in enumerate(peaks):
-        min_col     = max(0, properties['left_bases'][idx])
-        max_col     = min(rotated_mask.shape[1], properties['right_bases'][idx])
-        valid_pts   = np.argwhere(rotated_bathy[:, min_col:max_col])
-        if len(valid_pts) == 0:
-            raise ValueError(
-                f"No valid bathy pixels in the band around peak column {peak}. "
-                "Try increasing band_width or lowering min_line_factor."
-            )
-        valid_rows = np.sort(valid_pts[:, 0])
-        line_mask[valid_rows, peak] = True
+    # # Stamp each peak column with all valid bathy rows inside its base window
+    # # so every detected line is exactly 1 pixel wide at the peak position
+    # line_mask = np.zeros_like(rotated_bathy, dtype=bool)
+    # for idx, peak in enumerate(peaks):
+    #     min_col     = max(0, properties['left_bases'][idx])
+    #     max_col     = min(rotated_mask.shape[1], properties['right_bases'][idx])
+    #     # Find all valid bathy pixels in the window around the peak
+    #     valid_pts   = np.argwhere(rotated_bathy[:, min_col:max_col])
+    #     if len(valid_pts) == 0:
+    #         raise ValueError(
+    #             f"No valid bathy pixels in the band around peak column {peak}. "
+    #             "Try increasing band_width or lowering min_line_factor."
+    #         )
+    #     valid_rows = np.sort(valid_pts[:, 0])
+    #     line_mask[valid_rows, peak] = True
+
+    # # Plot line mask for debugging
+    # plt.figure(figsize=(10, 8))
+    # plt.imshow(1 - line_mask, cmap='gray')
+    # plt.show()
 
     # Remove components smaller than min_blob_pct of the largest component
-    label_img   = label(line_mask)
-    props       = regionprops(label_img)
-    blob_sizes  = np.array([r.area for r in props])
-    noise_limit = int(blob_sizes.max() * min_blob_pct)
-    restored_mask = remove_small_objects(line_mask, max_size=noise_limit)
+    # label_img   = label(line_mask)
+    # props       = regionprops(label_img)
+    # blob_sizes  = np.array([r.area for r in props])
+    # noise_limit = int(blob_sizes.max() * min_blob_pct)
+    # restored_mask = remove_small_objects(line_mask, max_size=noise_limit)
+    restored_mask = rotated_mask.astype(bool)
+
+    # # Plot restored mask for debugging
+    # plt.figure(figsize=(10, 8))
+    # plt.imshow(1 - restored_mask, cmap='gray')
+    # plt.title("Restored Trackline Mask (Rotated Frame)")
+    # plt.show()
 
     return np.sort(peaks), restored_mask, angle_to_rotate
 

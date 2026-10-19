@@ -143,7 +143,7 @@ def filter_squares_keep_lines(
     # Pixels that survive the square opening are blob-like; subtract them
     squares_filtered = (1 - opening(img, footprint=footprint)) & img
 
-    return squares_filtered
+    return squares_filtered.astype(bool)
 
 
 def filter_morphological_operations(binary_image: np.ndarray,

@@ -94,6 +94,7 @@ def process_line_pair(
     # --- Look up the estimator from the registry (includes plugin methods) ---
     compute_uncertainty = get_estimator(method)
 
+
     seg_energy1, freqs = compute_uncertainty(shared1, resolution=resolution,
                                              line_spacing=linespan, **estimator_kwargs)
     seg_energy2, _     = compute_uncertainty(shared2, resolution=resolution,
