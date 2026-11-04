@@ -101,7 +101,22 @@ def process_line_pair(
                                              line_spacing=linespan, **estimator_kwargs)
 
     # --- Average spectra, then collapse to scalar RMS per segment ---
-    avg_energy      = (seg_energy1 + seg_energy2) / 2.0  # (n_segments, n_freqs) m²/Hz
+    # avg_energy      = (seg_energy1 + seg_energy2) / 2.0  # (n_segments, n_freqs) m²/Hz
+
+    # Use the left half of the spectrum (one-sided PSD) for RMS calculation
+    seg_energy2 = seg_energy2[:,::-1]  # Reverse the second spectrum to align frequencies
+    # if number of frequency bins is odd, we need to take care of the middle bin
+    avg_energy = np.zeros_like(seg_energy2)
+    if seg_energy1.shape[1] % 2 == 1:
+        mid_bin = seg_energy1.shape[1] // 2
+        avg_energy[:, mid_bin] = (seg_energy1[:, mid_bin] + seg_energy2[:, mid_bin]) / 2.0
+        avg_energy[:, :mid_bin] = seg_energy1[:, :mid_bin]
+        avg_energy[:, mid_bin+1:] = seg_energy2[:, mid_bin+1:]
+    else:
+        mid_bin = seg_energy1.shape[1] // 2
+        avg_energy[:, :mid_bin] = seg_energy1[:, :mid_bin]
+        avg_energy[:, mid_bin:] = seg_energy1[:, mid_bin:]
+
     delta_f         = freqs[1] - freqs[0]
     uncertainty_rms = np.sqrt(np.sum(avg_energy * delta_f, axis=1))  # (n_segments,) m
 
