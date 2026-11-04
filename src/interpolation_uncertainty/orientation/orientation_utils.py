@@ -5,18 +5,21 @@ from scipy.signal import find_peaks
 ### orientation utility functions
 
 def find_temp_offset(heights: list[float] | np.ndarray) -> float:
-    """
-    If data has near vertical or horizontal features, this function returns an offset computed from
+    """If data has near vertical or horizontal features, this function returns an offset computed from
     the widest valley using inverted peak detection.
 
     This is useful for determining the appropriate rotation angle to align features in the data.
 
-    Parameters:
-    - heights: 1D array of histogram bin heights.
+    Parameters
+    ----------
+    heights : list of float or np.ndarray
+        1D array of histogram bin heights.
 
-    Returns:
-    - angle_of_valley: The angle corresponding to the widest valley in the histogram.
-    If no valleys are found, returns 0 indicating no shift is needed.
+    Returns
+    -------
+    angle_of_valley : float
+        The angle corresponding to the widest valley in the histogram.
+        If no valleys are found, returns 0 indicating no shift is needed.
     """
     from scipy.signal import peak_widths
 

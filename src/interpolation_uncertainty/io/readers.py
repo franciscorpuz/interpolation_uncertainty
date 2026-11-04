@@ -1,12 +1,12 @@
-import numpy as np
 from osgeo import gdal
 from pathlib import Path
-from typing import Union
+from typing import Union, Any
 
 gdal.UseExceptions()
 
 
-def read_file(filename: Union[str, Path], verbose: bool = False) -> dict:
+def read_file(filename: Union[str, Path],
+              verbose: bool = False) -> dict[str, Any]:
     """Read a raster or BAG file and extract depth data and metadata.
 
     Parameters

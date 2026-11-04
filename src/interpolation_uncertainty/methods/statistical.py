@@ -10,8 +10,7 @@ def statistical_estimator(
     multiple: int = 1,
     method: str = "SAR",
 ):
-    """
-    Efficiently compute uncertainty estimates statistically using sliding window
+    """Efficiently compute uncertainty estimates statistically using sliding window.
 
     Parameters
     ----------

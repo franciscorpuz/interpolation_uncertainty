@@ -42,9 +42,9 @@ def rotate_points(points: np.ndarray,
 
     Returns
     -------
-    np.ndarray
+    rotated_coords : np.ndarray
         Rotated point array of the same shape as ``points``.
-    tuple
+    center : tuple
         center coordinates
     """
 

@@ -37,8 +37,7 @@ def orientation_via_PCA(binary_image,
         2-D float array of the same shape as ``binary_image``.  Each
         foreground pixel carries its local orientation in degrees (wrapped
         to ``[0, 180)``); background pixels are ``NaN``.
-
-    angle_profile: np.ndarray
+    angle_profile : np.ndarray
         histogram of the angle scores detected by 'pca'
     """
 

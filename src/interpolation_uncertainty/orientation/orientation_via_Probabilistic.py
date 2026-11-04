@@ -49,8 +49,7 @@ def orientation_via_probabilistic_line(binary_image: np.ndarray,
           in degrees.
         - ``'profile_variance'`` : np.ndarray of float — variance profile
           over all tested angles (rolled so index 0 corresponds to 0°).
-
-    angle_profile: np.ndarray
+    angle_profile : np.ndarray
         histogram of the angle scores detected by 'radon'
     """
 
@@ -134,8 +133,7 @@ def label_points_by_angle(x,
                           bin_width= 1.0,
                           tol=1.5,
                           min_peak_prominence= 5):
-    """
-    Assign each point to its closest trackline family across all dominant angles.
+    """Assign each point to its closest trackline family across all dominant angles.
 
     For each image-convention angle φ in ``theta_degs`` the function converts
     back to the sinogram projection angle (φ + 90°) so that points on the same
@@ -232,31 +230,13 @@ def label_points_by_probabilistic_line(x, y,
                                       num_neighbors=5,
                                       chain_length=100,
                                       n_times=3):
-    """
-    Assign each point a local angle orientation using probabilistic line fitting.
+    """Assign each point a local angle orientation using probabilistic line fitting.
 
     Runs a multi-vote ensemble: the core algorithm is repeated until every
     point has been visited at least ``n_times``, and the final label is the
     angle family that received the most votes (mode).  Points that are always
     near a trackline boundary get their correct family reinforced across
     independent random probes, suppressing one-off mislabels.
-
-    Steps (per iteration):
-    1. Randomly select an under-labeled point from the foreground.
-    2. Greedily chain ``chain_length`` nearest neighbours to build a local
-       linear probe.
-    3. Compute the mean inter-point distance along the chain.
-    4. Fit PCA to the chain; extract the dominant direction as an angle.
-    4a. Snap the angle to the closest entry in ``theta_degs`` (within ``tol``);
-        discard the probe (no vote) if no entry is close enough.
-    5. Find all foreground points within ``bin_width`` pixels perpendicular
-       to the snapped line through the starting point.
-    6. Flood-fill a connected segment from the starting point through the
-       near-line set, using ``2 × mean_dist`` as the adjacency radius.
-    7. Cast one vote for the snapped angle family on every under-labeled
-       point in the connected segment.
-    8. Repeat until every point has been visited ``n_times``.
-    9. Resolve each point's label as ``argmax`` of its vote histogram.
 
     Parameters
     ----------
@@ -290,6 +270,26 @@ def label_points_by_probabilistic_line(x, y,
     all_peak_centers : list
         Empty list; returned for API symmetry with ``label_points_by_angle``.
         This method does not compute ρ-space trackline centers.
+
+    Notes
+    -----
+    Steps (per iteration):
+
+    1. Randomly select an under-labeled point from the foreground.
+    2. Greedily chain ``chain_length`` nearest neighbours to build a local
+       linear probe.
+    3. Compute the mean inter-point distance along the chain.
+    4. Fit PCA to the chain; extract the dominant direction as an angle.
+    4a. Snap the angle to the closest entry in ``theta_degs`` (within ``tol``);
+        discard the probe (no vote) if no entry is close enough.
+    5. Find all foreground points within ``bin_width`` pixels perpendicular
+       to the snapped line through the starting point.
+    6. Flood-fill a connected segment from the starting point through the
+       near-line set, using ``2 × mean_dist`` as the adjacency radius.
+    7. Cast one vote for the snapped angle family on every under-labeled
+       point in the connected segment.
+    8. Repeat until every point has been visited ``n_times``.
+    9. Resolve each point's label as ``argmax`` of its vote histogram.
     """
     theta_degs = np.asarray(theta_degs, dtype=float)
     x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
@@ -431,8 +431,7 @@ def label_points_by_probabilistic_line2(x, y,
                                         num_neighbors=20,
                                         chain_length=10,
                                         min_tentative=5):
-    """
-    Two-tier probabilistic line labeling without BFS connectivity.
+    """Two-tier probabilistic line labeling without BFS connectivity.
 
     Each randomly selected point receives a **definitive** label from its
     local PCA angle (snapped to a Radon-detected family).  Every point that

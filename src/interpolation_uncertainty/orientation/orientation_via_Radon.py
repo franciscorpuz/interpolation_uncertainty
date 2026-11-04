@@ -3,7 +3,6 @@
 
 import numpy as np
 from skimage.transform import radon, iradon, rotate
-import time
 from matplotlib import pyplot as plt
 from scipy.ndimage import (maximum_filter, zoom, label,
                            binary_dilation, maximum_position,
@@ -22,7 +21,8 @@ def orientation_via_Radon(binary_image: np.ndarray,
                         min_intensity: float = 0.05,
                         top_angles: int = 3,
                         do_offset: bool = False,
-                        zoom_factor: float = 2.0) :
+                        zoom_factor: float = 2.0,
+                        show_plot: bool = True) :
     """Find the dominant orientation of linear features using the Radon transform.
 
     Computes the Radon sinogram over ``test_angles`` by computing for the
@@ -35,6 +35,9 @@ def orientation_via_Radon(binary_image: np.ndarray,
     ----------
     binary_image : np.ndarray
         Binary image containing linear features.
+    angle_info : dict, optional
+        ``theta_info`` returned by a previous call; reuses its sinogram and
+        offset instead of recomputing the Radon transform.
     circle : bool, optional
         If ``True``, only pixels within the circle inscribed in the central
         square are projected — Set to ``False`` as we need to reconstruct the image
@@ -48,67 +51,158 @@ def orientation_via_Radon(binary_image: np.ndarray,
         Minimum intensity of a pixel to be considered part of a linear feature.
     top_angles : int, optional
         Number of dominant angles to return. If set to 0, all detected angles are returned.
-    do_offset: bool, optional
+    do_offset : bool, optional
         Set to 'True' if data has near vertical or horizontal features
         to offset for better peak detection. Default is ``False``.
+    zoom_factor : float, optional
+        Down-scaling factor applied before the Radon transform. Default is 2.0.
+    show_plot : bool, optional
+        Draw the log profile variance figure. Default is ``True``.
 
     Returns
     -------
+    point_orientations : dict
+        ``{angle_deg: float_raster}`` with the pixels of each detected angle
+        family, plus ``'combined'`` holding all families. Background is NaN.
     theta_info : dict
-        Dictionary with keys:
-
-        - ``'peaks'`` : np.ndarray of float — dominant angle(s) in degrees,
-          sorted by descending prominence.
-        - ``'widths_in_degrees'`` : np.ndarray of float — FWHM of each peak
-          in degrees.
-        - ``'profile_variance'`` : np.ndarray of float — variance profile
-          over all tested angles (rolled so index 0 corresponds to 0°).
-
-    angle_profile: dict
-        - Python dict containing computed angles for faster debugging
-
+        ``{'theta', 'sinogram', 'temp_offset'}``; pass it back as ``angle_info``
+        to skip the Radon transform on later calls.
     """
-
-
-    # Remove excess whitespace around the tracks
+    # Remove excess whitespace around the tracks, then scale down for the Radon transform
     sub_image, bounding_box = _sub_image(binary_image)
-
-    # Scale the sub-image to reduce computation time for the Radon transform
     input_image = zoom(sub_image, zoom=1/zoom_factor, order=0)
 
-    temp_offset = 0
-    # If theta has been computed in previous runs, we can skip the
-    # Radon transform and use the precomputed values.
-    if angle_info is not None:
-        print(f"Using pre-computed sinogram...")
-        sinogram = angle_info['sinogram']
-        temp_offset = angle_info['temp_offset']
-        theta_range = np.arange(temp_offset, temp_offset + 180)
+    sinogram, theta_range, temp_offset = _compute_sinogram(input_image, angle_info,
+                                                           circle, do_offset)
+    log_profile_variance = _log_profile_variance(sinogram)
 
-    else:
-        # Compute the Radon transform
-        theta_range = list(np.arange(180)) # 180 angles uniformly spaced over [0°, 180°)
-        print("Computing initial Radon transform...", end=" ")
-        sinogram = radon(input_image, theta=theta_range, circle=circle)
+    if show_plot:
+        _plot_profile_variance(theta_range, log_profile_variance)
+
+    detected_angles_radon = _detect_dominant_angles(log_profile_variance,
+                                                    angular_tolerance, top_angles)
+    print(f"Detected peaks (xy) adjusted :"
+          f"{_radon_angle_to_xy(detected_angles_radon, temp_offset)}")
+
+    line_dict = {}
+    for radon_angle in detected_angles_radon:
+        xy_angle = _radon_angle_to_xy(radon_angle, temp_offset)
+        print(f"Reconstructing image from angle {xy_angle} degrees...", end=" ")
+        line_mask = _reconstruct_family_mask(sinogram, theta_range, radon_angle,
+                                             input_image.shape, circle,
+                                             angular_tolerance, min_intensity,
+                                             zoom_factor)
         print("Done.")
+        line_mask = _fit_mask_to_shape(line_mask, sub_image.shape)
+        line_dict[xy_angle] = _embed_in_full_image(line_mask, binary_image.shape,
+                                                   bounding_box)
 
-    # Variance corresponds to the strength of the linear features at each angle
-    profile_variance = np.var(sinogram, axis=0)
-    log_profile_variance = np.log1p(profile_variance)
+    print("Extending lines to full image width...", end=" ")
+    angle_extended = _extend_line_to_edges2(line_dict)
+    print("Done.")
 
-    # if data has near vertical or horizontal features when visually observed,
-    # offset the profile variance to enhance peak detection at edges (0° and 180°)
-    if do_offset and not angle_info:
-        temp_offset = find_temp_offset(log_profile_variance)
+    print("Labeling points...", end=" ")
+    combined_angle_raster = _combine_angle_rasters(angle_extended, binary_image.shape)
+    point_orientations = {
+        'combined': _label_points(combined_angle_raster, binary_image, width_tolerance),
+    }
+    print("Done.")
+    point_orientations.update(_split_by_angle(point_orientations['combined'],
+                                              angle_extended.keys()))
+
+    theta_info = {
+        "theta": theta_range,
+        "sinogram": sinogram,
+        "temp_offset": temp_offset,
+    }
+
+    return point_orientations, theta_info
+
+
+def _log_profile_variance(sinogram):
+    """Log-variance of each sinogram column (one value per projection angle).
+
+    Variance is the strength of the linear features at each angle.
+
+    Parameters
+    ----------
+    sinogram : np.ndarray
+        Radon sinogram of shape ``(n_projections, n_angles)``.
+
+    Returns
+    -------
+    np.ndarray
+        1-D array of length ``n_angles`` with ``log1p(var)`` of each column.
+    """
+    return np.log1p(np.var(sinogram, axis=0))
+
+
+def _compute_sinogram(input_image, angle_info, circle, do_offset):
+    """Compute the Radon sinogram of ``input_image``, or reuse a previous one.
+
+    If ``angle_info`` (a previous ``theta_info``) is given its sinogram and
+    offset are reused.  Otherwise the Radon transform is computed over
+    [0°, 180°); with ``do_offset`` it is recomputed starting at the angle found
+    by :func:`find_temp_offset`, so peaks near 0°/180° are not split by the edge.
+
+    Parameters
+    ----------
+    input_image : np.ndarray
+        Binary image passed to ``skimage.transform.radon``.
+    angle_info : dict or None
+        Previous ``theta_info`` with keys ``'sinogram'`` and ``'temp_offset'``.
+        If ``None`` the sinogram is computed.
+    circle : bool
+        Forwarded to ``skimage.transform.radon``.
+    do_offset : bool
+        Recompute the sinogram starting at the widest-valley angle. Ignored
+        when ``angle_info`` is given.
+
+    Returns
+    -------
+    sinogram : np.ndarray
+        Radon sinogram of shape ``(n_projections, 180)``.
+    theta_range : list or np.ndarray
+        Projection angles in degrees, one per sinogram column.
+    temp_offset : int
+        Angle (degrees) at which ``theta_range`` starts; 0 without an offset.
+    """
+    if angle_info is not None:
+        print("Using pre-computed sinogram...")
+        temp_offset = angle_info['temp_offset']
+        return (angle_info['sinogram'], np.arange(temp_offset, temp_offset + 180),
+                temp_offset)
+
+    theta_range = list(np.arange(180))  # 180 angles uniformly spaced over [0°, 180°)
+    print("Computing initial Radon transform...", end=" ")
+    sinogram = radon(input_image, theta=theta_range, circle=circle)
+    print("Done.")
+
+    temp_offset = 0
+    if do_offset:
+        temp_offset = find_temp_offset(_log_profile_variance(sinogram))
         theta_range = np.arange(temp_offset, temp_offset + 180)
         print("Computing Radon transform with offset...", end=" ")
         sinogram = radon(input_image, theta=theta_range, circle=circle)
         print("Done.")
-        profile_variance = np.var(sinogram, axis=0)
-        log_profile_variance = np.log1p(profile_variance)
+    return sinogram, theta_range, temp_offset
 
 
-    # Plot the log profile variance for visual inspection
+def _plot_profile_variance(theta_range, log_profile_variance):
+    """Plot the log profile variance against the image (x-y) angle.
+
+    Parameters
+    ----------
+    theta_range : array-like
+        Projection angles in degrees, one per profile value; may start at an
+        offset and is folded into [0, 180) before plotting.
+    log_profile_variance : array-like
+        Log profile variance, one value per entry of ``theta_range``.
+
+    Returns
+    -------
+    None
+    """
     plt.figure(figsize=(10, 5))
     # theta_range may start at temp_offset (e.g. 60..239); fold it into [0, 180) and
     # re-sort so the x-axis always spans 0-180 (the profile is 180-periodic)
@@ -125,128 +219,211 @@ def orientation_via_Radon(binary_image: np.ndarray,
     plt.axvline(x=180, color='orange', linestyle='--', label='180°')
     plt.legend()
 
-    # Apply peak detection to the log profile variance to find dominant angles
+
+def _detect_dominant_angles(log_profile_variance, angular_tolerance, top_angles):
+    """Find the sinogram column indices of the profile peaks, most prominent first.
+
+    ``top_angles <= 0`` keeps every detected peak.
+
+    Parameters
+    ----------
+    log_profile_variance : np.ndarray
+        1-D log profile variance, one value per sinogram column.
+    angular_tolerance : int
+        Minimum distance in columns between two detected peaks.
+    top_angles : int
+        Number of most prominent peaks to keep; ``<= 0`` keeps all.
+
+    Returns
+    -------
+    np.ndarray of int
+        Column indices of the kept peaks, sorted by descending prominence.
+    """
     print("Detecting peaks in the log profile variance...", end=" ")
-    detected_angles_radon, properties = find_peaks(log_profile_variance,
-                                                   distance=angular_tolerance,
-                                                   prominence=0.01)
+    peaks, properties = find_peaks(log_profile_variance,
+                                   distance=angular_tolerance,
+                                   prominence=0.01)
     print("Done.")
 
-
-    # Sort the detected angles by their peak heights in descending order
-    # to give priority to the most prominent angles
     sorted_indices = np.argsort(properties["prominences"])[::-1]
-
-    # Keep only the top N angles based on the specified parameter
     if top_angles > 0 and len(sorted_indices) > top_angles:
         sorted_indices = sorted_indices[:top_angles]
         print(f"Keeping top {top_angles} detected angles.")
-
-    detected_angles_radon = detected_angles_radon[sorted_indices]
-    print(f"Detected peaks (xy) adjusted :{_radon_angle_to_xy(detected_angles_radon,
-                                                              temp_offset)}")
+    return peaks[sorted_indices]
 
 
-    line_dict = {}
-    for i, radon_angle in enumerate(detected_angles_radon):
+def _reconstruct_family_mask(sinogram, theta_range, radon_angle, image_shape, circle,
+                             angular_tolerance, min_intensity, zoom_factor):
+    """Reconstruct a boolean mask of the lines of one angle family.
 
-        # Define the angular range for this family (sinogram column indices)
-        radon_theta_min = max(0, radon_angle - angular_tolerance)
-        radon_theta_max = min(sinogram.shape[1] - 1, radon_angle + angular_tolerance)
+    Back-projects only the sinogram columns within ``angular_tolerance`` of
+    ``radon_angle``, normalises to [0, 1], thresholds at ``min_intensity`` and
+    zooms back up.  ``image_shape`` is the shape that was fed to ``radon``.
 
-        # Extract sinogram data inside this angular window
-        band_mask = np.zeros_like(sinogram, dtype=float)
-        band_mask[:, radon_theta_min: radon_theta_max + 1] = sinogram[:, radon_theta_min: radon_theta_max + 1]
+    Parameters
+    ----------
+    sinogram : np.ndarray
+        Radon sinogram of shape ``(n_projections, n_angles)``.
+    theta_range : list or np.ndarray
+        Projection angles in degrees, one per sinogram column.
+    radon_angle : int
+        Sinogram column index at the centre of the family.
+    image_shape : tuple of int
+        ``(rows, cols)`` of the image that was fed to ``radon``.
+    circle : bool
+        Must match the value used for the forward ``radon`` call.
+    angular_tolerance : int
+        Half-width in columns of the band around ``radon_angle``.
+    min_intensity : float
+        Threshold as a fraction of the maximum of the normalised reconstruction.
+    zoom_factor : float
+        Up-scaling factor applied to the mask before it is returned.
 
-        # circle must match the forward radon call, otherwise iradon assumes a
-        # different geometry and returns a min(H, W) square
-        x_cols, y_rows = input_image.shape[1], input_image.shape[0]
-        iradon_kwargs = {} if circle else {"output_size": max(y_rows, x_cols)}
-        xy_angle = _radon_angle_to_xy(radon_angle, temp_offset)
-        print(f"Reconstructing image from angle {xy_angle} degrees...", end=" ")
-        start_time = time.perf_counter()
-        new_radon_theta_range = theta_range[radon_theta_min: radon_theta_max + 1]
-        sinogram_band = band_mask[:, radon_theta_min: radon_theta_max + 1]
-        reconstructed = iradon(sinogram_band,
-                               theta=new_radon_theta_range,
-                               filter_name="ramp",
-                               circle=circle, **iradon_kwargs)
-        end_time = time.perf_counter()
-        execution_time = end_time - start_time
-        print(f"Done.")
+    Returns
+    -------
+    np.ndarray of bool
+        Mask of ``image_shape`` scaled by ``zoom_factor``.
+    """
+    # Angular range for this family (sinogram column indices)
+    theta_min = max(0, radon_angle - angular_tolerance)
+    theta_max = min(sinogram.shape[1] - 1, radon_angle + angular_tolerance)
+    sinogram_band = sinogram[:, theta_min: theta_max + 1].astype(float)
 
-        isolated_lines = _align_reconstruction(reconstructed, input_image.shape, circle)
+    # circle must match the forward radon call, otherwise iradon assumes a
+    # different geometry and returns a min(H, W) square
+    iradon_kwargs = {} if circle else {"output_size": max(image_shape)}
+    reconstructed = iradon(sinogram_band,
+                           theta=theta_range[theta_min: theta_max + 1],
+                           filter_name="ramp",
+                           circle=circle, **iradon_kwargs)
 
-        # Normalize to [0, 1] for visualization
-        isolated_lines = np.clip(isolated_lines, 0, None)
-        if isolated_lines.max() > 0:
-            isolated_lines /= isolated_lines.max()
+    isolated_lines = _align_reconstruction(reconstructed, image_shape, circle)
+    isolated_lines = np.clip(isolated_lines, 0, None)
+    if isolated_lines.max() > 0:
+        isolated_lines /= isolated_lines.max()
+
+    line_mask = isolated_lines > min_intensity * isolated_lines.max()
+    return zoom(line_mask, zoom=zoom_factor, order=0).astype(bool)
 
 
-        # Thresholded overlay onto original
-        threshold = min_intensity * isolated_lines.max()
-        line_mask = isolated_lines > threshold
-        line_mask = zoom(line_mask, zoom=zoom_factor, order=0)
-        line_mask = line_mask.astype(bool)
+def _fit_mask_to_shape(mask, shape):
+    """Crop (bottom/right) or zero-pad (bottom/right) ``mask`` to ``shape``.
 
-        # Scaling the binary image can introduce dimension misalignment,
-        # so we need to crop or pad the line_mask to match the sub_image size
-        # Add or remove padding to match the sub_image size
-        if line_mask.shape[0] < sub_image.shape[0]:
-            pad_height = sub_image.shape[0] - line_mask.shape[0]
-            line_mask = np.pad(line_mask, ((0, pad_height), (0, 0)), mode='constant', constant_values=False)
-        elif line_mask.shape[0] > sub_image.shape[0]:
-            line_mask = line_mask[:sub_image.shape[0], :]
-        if line_mask.shape[1] < sub_image.shape[1]:
-            pad_width = sub_image.shape[1] - line_mask.shape[1]
-            line_mask = np.pad(line_mask, ((0, 0), (0, pad_width)), mode='constant', constant_values=False)
-        elif line_mask.shape[1] > sub_image.shape[1]:
-            line_mask = line_mask[:, :sub_image.shape[1]]
-        # Pad the line_mask to match the original image size
-        padded_line_mask = np.zeros_like(binary_image, dtype=bool)
-        min_row, max_row, min_col, max_col = bounding_box
-        padded_line_mask[min_row:max_row + 1, min_col:max_col + 1] = line_mask
+    Scaling the image down and up can be off by a pixel or two.
 
-        # Convert the Radon angle to the corresponding image (x-y) angle
-        xy_theta = _radon_angle_to_xy(radon_angle, temp_offset)
-        line_dict[xy_theta] = padded_line_mask
+    Parameters
+    ----------
+    mask : np.ndarray of bool
+        2-D mask to fit.
+    shape : tuple of int
+        Target ``(rows, cols)``.
 
-    print("Extending lines to full image width...", end=" ")
-    angle_extended = _extend_line_to_edges2(line_dict)
-    print("Done.")
-    # angle_extended = line_dict
+    Returns
+    -------
+    np.ndarray of bool
+        Mask of exactly ``shape``.
+    """
+    mask = mask[:shape[0], :shape[1]]
+    pad_rows, pad_cols = shape[0] - mask.shape[0], shape[1] - mask.shape[1]
+    if pad_rows or pad_cols:
+        mask = np.pad(mask, ((0, pad_rows), (0, pad_cols)),
+                      mode='constant', constant_values=False)
+    return mask
 
-    point_orientations = {}
-    print("Labeling points...", end=" ")
-    combined_angle_raster = np.full(binary_image.shape, np.nan, dtype=float)
-    for angle in angle_extended.keys():
-        angle_raster = angle_extended[angle]
-        mask = angle_raster.astype(bool) & np.isnan(combined_angle_raster)
-        combined_angle_raster[mask] = float(angle)
 
+def _embed_in_full_image(mask, full_shape, bounding_box):
+    """Place a cropped ``mask`` back at ``bounding_box`` of an empty ``full_shape`` canvas.
+
+    Parameters
+    ----------
+    mask : np.ndarray of bool
+        Cropped mask, matching the bounding box size.
+    full_shape : tuple of int
+        ``(rows, cols)`` of the canvas.
+    bounding_box : tuple of int
+        ``(min_row, max_row, min_col, max_col)``, inclusive, as returned by
+        :func:`_sub_image`.
+
+    Returns
+    -------
+    np.ndarray of bool
+        Canvas of ``full_shape`` with ``mask`` placed at ``bounding_box``.
+    """
+    min_row, max_row, min_col, max_col = bounding_box
+    full = np.zeros(full_shape, dtype=bool)
+    full[min_row:max_row + 1, min_col:max_col + 1] = mask
+    return full
+
+
+def _combine_angle_rasters(angle_masks, shape):
+    """Combine per-angle masks into one float raster; the first family claims a pixel.
+
+    Parameters
+    ----------
+    angle_masks : dict
+        ``{angle_deg: bool_mask}``, all masks of ``shape``.
+    shape : tuple of int
+        ``(rows, cols)`` of the output raster.
+
+    Returns
+    -------
+    np.ndarray of float
+        Raster of ``shape`` holding each pixel's angle; ``NaN`` where no mask is set.
+    """
+    combined = np.full(shape, np.nan, dtype=float)
+    for angle, angle_raster in angle_masks.items():
+        mask = angle_raster.astype(bool) & np.isnan(combined)
+        combined[mask] = float(angle)
+    return combined
+
+
+def _label_points(combined_angle_raster, binary_image, width_tolerance):
+    """Give every (thickened) foreground pixel the angle of its nearest labelled pixel.
+
+    Parameters
+    ----------
+    combined_angle_raster : np.ndarray of float
+        Raster of angles, ``NaN`` where unlabelled.
+    binary_image : np.ndarray of bool
+        Foreground image to label.
+    width_tolerance : int
+        Side length in pixels of the square used to thicken ``binary_image``.
+
+    Returns
+    -------
+    np.ndarray of float
+        Raster of the shape of ``binary_image``; the nearest labelled angle on
+        thickened foreground pixels, ``NaN`` elsewhere.
+    """
     # EDT measures distance to the nearest zero pixel, so pass the "has angle"
     # mask inverted: labelled pixels become 0, and return_indices gives the
     # (row, col) of the nearest one for every pixel.
     has_angle = ~np.isnan(combined_angle_raster)
     _, (ri, ci) = distance_transform_edt(~has_angle, return_indices=True)
     nearest_angle = combined_angle_raster[ri, ci]  # nearest labelled value everywhere
-    thickened_binary = binary_dilation(binary_image, structure=np.ones((width_tolerance, width_tolerance)))
-    point_orientations['combined'] = np.where(thickened_binary, nearest_angle, np.nan)
-    print("Done.")
+    thickened_binary = binary_dilation(binary_image,
+                                       structure=np.ones((width_tolerance, width_tolerance)))
+    return np.where(thickened_binary, nearest_angle, np.nan)
 
-    for angle in angle_extended.keys():
-        point_orientations[angle] = np.where(point_orientations['combined'] == float(angle),
-                                             float(angle),
-                                             np.nan)
 
-    theta_info = {
-        "theta": theta_range,
-        "sinogram": sinogram,
-        "temp_offset": temp_offset,
-    }
+def _split_by_angle(combined, angles):
+    """Split a combined angle raster into one raster per angle.
 
-    return point_orientations, theta_info
+    Parameters
+    ----------
+    combined : np.ndarray of float
+        Raster of angles, ``NaN`` where unlabelled.
+    angles : iterable
+        Angles in degrees to extract.
 
+    Returns
+    -------
+    dict
+        ``{angle: raster}`` keeping only the pixels of ``combined`` labelled
+        with that angle; all other pixels are ``NaN``.
+    """
+    return {angle: np.where(combined == float(angle), float(angle), np.nan)
+            for angle in angles}
 
 def _radon_angle_to_xy(radon_angle, temp_offset=0):
     """Convert a Radon angle to the corresponding image (x-y) angle.
@@ -266,10 +443,25 @@ def _radon_angle_to_xy(radon_angle, temp_offset=0):
     return (radon_angle - 90 + temp_offset) % 180
 
 def _sub_image(image):
-    """Crop the image to the bounding box of its foreground pixels."""
+    """Crop the image to the bounding box of its foreground pixels.
+
+    An image with no foreground is returned whole, with the box spanning all of it.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        2-D image whose non-zero pixels are the foreground.
+
+    Returns
+    -------
+    sub_image : np.ndarray
+        ``image`` cropped to the bounding box.
+    bounding_box : tuple of int
+        ``(min_row, max_row, min_col, max_col)``, inclusive.
+    """
     rows, cols = np.where(image)
     if len(rows) == 0 or len(cols) == 0:
-        return image  # No foreground pixels
+        return image, (0, image.shape[0] - 1, 0, image.shape[1] - 1)
     min_row, max_row = rows.min(), rows.max()
     min_col, max_col = cols.min(), cols.max()
     bounding_box = (min_row, max_row, min_col, max_col)
@@ -282,6 +474,18 @@ def _radon_center(shape, circle):
     With ``circle=False`` the image is padded symmetrically about ``shape // 2``.
     With ``circle=True`` it is first cropped to a centred square whose start
     offset is rounded up, which shifts the centre by one pixel on odd excess.
+
+    Parameters
+    ----------
+    shape : tuple of int
+        ``(rows, cols)`` of the image.
+    circle : bool
+        The ``circle`` argument passed to ``radon``/``iradon``.
+
+    Returns
+    -------
+    tuple of int
+        ``(row, col)`` of the rotation centre.
     """
     h, w = shape
     if not circle:
@@ -295,6 +499,20 @@ def _align_reconstruction(reconstructed, shape, circle):
 
     The reconstruction can be larger (``circle=False``) or smaller
     (``circle=True``) than the original; pixels with no counterpart are 0.
+
+    Parameters
+    ----------
+    reconstructed : np.ndarray
+        2-D output of ``iradon``.
+    shape : tuple of int
+        ``(rows, cols)`` of the original image.
+    circle : bool
+        The ``circle`` argument used for the forward and inverse transforms.
+
+    Returns
+    -------
+    np.ndarray
+        Array of ``shape`` with the reconstruction overlaid on the original pixels.
     """
     h, w = shape
     rh, rw = reconstructed.shape
@@ -308,12 +526,27 @@ def _align_reconstruction(reconstructed, shape, circle):
 
 
 def _radon_line_endpoints(s_val, theta_deg, center, shape):
-    """Return the two ``(x, y)`` points where the Radon line ``(s, theta)``
-    crosses the image border.
+    """Return the two ``(x, y)`` points where the Radon line ``(s, theta)`` crosses the image border.
 
     skimage's projection offset is ``s = (x - cx)·cos(θ) − (y - cy)·sin(θ)``
     with ``θ`` the Radon angle in degrees and ``(cy, cx)`` from ``_radon_center``.
-    Returns ``None`` if the line does not cross the image.
+
+    Parameters
+    ----------
+    s_val : float
+        Projection offset of the line.
+    theta_deg : float
+        Radon angle in degrees.
+    center : tuple of int
+        ``(cy, cx)`` rotation centre, from :func:`_radon_center`.
+    shape : tuple of int
+        ``(rows, cols)`` of the image.
+
+    Returns
+    -------
+    list of tuple or None
+        The two ``(x, y)`` border points, or ``None`` if the line does not
+        cross the image.
     """
     cy, cx = center
     h, w = shape
@@ -500,10 +733,24 @@ def _extend_line_to_edges2(angle_dict: dict,
 def _collapse_candidates(peak_candidates, sinogram, r_gap=2):
     """Reduce candidate cells to one (r_idx, theta_idx) per physical line.
 
-    peak_candidates : bool (r, theta) mask, e.g. local_max & band_mask & above-threshold
-    sinogram        : the (r, theta) array the candidates came from
-    r_gap           : candidates whose r differs by up to this many rows (in adjacent
-                      theta columns) are treated as the same line
+    Parameters
+    ----------
+    peak_candidates : np.ndarray of bool
+        ``(r, theta)`` mask, e.g. local_max & band_mask & above-threshold.
+    sinogram : np.ndarray
+        The ``(r, theta)`` array the candidates came from.
+    r_gap : int, optional
+        Candidates whose r differs by up to this many rows (in adjacent
+        theta columns) are treated as the same line. Default is 2.
+
+    Returns
+    -------
+    s_indices : np.ndarray of int
+        Row (r) index of the strongest cell of each line.
+    a_indices : np.ndarray of int
+        Column (theta) index of the strongest cell of each line.
+    strength : np.ndarray of float
+        Total sinogram energy of each line.
     """
     # Grow candidates along r only, so crests that drift a few rows between
     # neighbouring columns still touch and end up in the same component.

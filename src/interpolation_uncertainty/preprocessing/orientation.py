@@ -29,12 +29,17 @@ def compute_local_orientation(binary_image,
 
     Returns
     -------
-    point_orientations : np.ndarray
-        2-D float array of the same shape as ``binary_image``.  Each
-        foreground pixel carries its local orientation in degrees (wrapped
-        to ``[0, 180)``); background pixels are ``NaN``.
-    angle_info: np.ndarray
-        Array containing information about the detected angles.
+    point_orientations : dict[int|str, np.ndarray]
+        Dictionary mapping a detected angle to a 2D float array of
+        the same shape as ``binary_image``.  Each foreground pixel carries
+        its local orientation in degrees (wrapped to ``[0, 180)``);
+        background pixels are ``NaN``.
+        dict['combined'] contains the combined orientation field from all detected angles.
+    angle_info : np.ndarray
+        generic variable that may contain additional information about the detected angles,
+        depending on the method used.
+        can be used to bypass recomputation of the orientation field if the same image is
+        processed multiple times with the same method.
     """
 
     if method == 'pca':
@@ -60,17 +65,6 @@ def compute_local_orientation(binary_image,
                                                                        precomputed_theta=kwargs.get('precomputed_theta', None))
     else:
         raise ValueError(f"Invalid method: {method}. Must be one of the following: 'pca', 'radon', 'probabilistic'.")
-
-    # if plot_orientation:
-    #     plt.figure(figsize=figsize)
-    #     plt.scatter(point_orientations[:,0], point_orientations[:,1], s=10, cmap='viridis', vmin=0, vmax=180,
-    #                 label='Local Orientation (degrees)')
-    #     plt.colorbar(label='Orientation (degrees)', shrink=0.5)
-    #     plt.title(f"Local Orientations via {method.upper()}")
-    #     plt.xlabel("X")
-    #     plt.ylabel("Y")
-    #     plt.gca().invert_yaxis()
-    #     plt.show()
 
     return point_orientations, angle_info
 

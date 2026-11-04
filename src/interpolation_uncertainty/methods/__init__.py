@@ -183,7 +183,7 @@ for _m in _SPECTRAL_METHODS:
 
 from .statistical import statistical_estimator  # noqa: E402
 
-_STATISTICAL_METHODS = ('sar', 'ser', 'smr')
+_STATISTICAL_METHODS = ('SAR', 'SER', 'SMR')
 for _m in _STATISTICAL_METHODS:
     _REGISTRY[_m] = functools.partial(statistical_estimator, method=_m)
 

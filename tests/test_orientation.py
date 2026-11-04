@@ -6,10 +6,8 @@ matplotlib.use("Agg")  # radon / probabilistic methods create figures
 import pytest
 import numpy as np
 
-from interpolation_uncertainty.preprocessing.orientation import (
-    compute_local_orientation,
-    find_temp_offset,
-)
+from interpolation_uncertainty.preprocessing.orientation import compute_local_orientation
+from interpolation_uncertainty.orientation.orientation_utils import find_temp_offset
 
 PCA_KWARGS = dict(line_length=10, num_neighbors=20)
 
