@@ -99,9 +99,11 @@ def test_radon_output_structure(line_image):
     masks, _ = compute_local_orientation(line_image, method="radon", zoom_factor=1.0)
     assert isinstance(masks, dict)
     for angle, mask in masks.items():
-        assert 0 <= angle < 180
-        assert mask.shape == line_image.shape
-        assert mask.dtype == bool
+        if isinstance(angle, str):
+            assert angle == "combined"
+        else:
+            assert 0 <= angle < 180
+            assert mask.shape == line_image.shape
 
 
 # --- compute_local_orientation: dispatcher -----------------------------------

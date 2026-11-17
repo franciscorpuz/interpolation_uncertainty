@@ -16,6 +16,11 @@ To evaluate and develop these methods, the library simulates sparse surveying on
 
 ## Installation
 
+Documentation: https://interpolation_uncertainty.readthedocs.io/
+
+**Requirements:** Python 3.10–3.12 and GDAL ≤ 3.11 (plus numpy, scipy, scikit-image,
+scikit-learn, matplotlib, tqdm — installed automatically).
+
 ### Quick install (pip)
 
 If you just want to use the library without modifying it:
@@ -33,7 +38,7 @@ This is the recommended approach — it handles GDAL and other geospatial C depe
 reliably via conda-forge.
 
 ```bash
-git clone https://github.com/noaa-ocs-hydrography/interpolation_uncertainty.git
+git clone https://github.com/noaa-ocs-hydrography/interpolation_uncertainty
 cd interpolation_uncertainty
 conda env create -f environment.yml
 conda activate interpolation_uncertainty
@@ -48,22 +53,45 @@ To update your environment after a `git pull`:
 conda env update -f environment.yml --prune
 ```
 
+`environment.yml` is generated from `pyproject.toml`. If you change the dependencies there,
+regenerate it with:
+
+```bash
+python scripts/sync_env_yml.py
+```
+
+### Verify the install and run the tests
+
+```bash
+python -c "import interpolation_uncertainty"
+pip install pytest
+pytest
+```
+
+The tests use a small committed fixture (`tests/test_data/sample_tiff.tif`), so no
+external data is required.
+
 ## Getting started
 
-See the notebooks in `notebooks/` for usage examples. The primary working notebook is
-`uncertainty_sim_nbs_dataset.ipynb`.
+The notebooks in `notebooks/` walk through the full workflow on real surveys (start with
+`sim_H13060.ipynb`). The sketch below shows the current API.
+
+> **Note:** `uncertainty_sim_nbs_dataset.ipynb` and `sim_H13060_xtrack_verfication.ipynb` still use the
+> older orientation API (`compute_dominant_angle_radon_transform`); the `sim_*.ipynb` notebooks and
+> the example below use the current one.
 
 ```python
+from skimage.morphology import opening, thin, disk
+
 from interpolation_uncertainty import (
     read_file, show_depth,
     build_coverage_mask,
-    compute_dominant_angle_radon_transform, compute_local_orientation,
+    compute_local_orientation,
     detect_trackline_positions, assign_depths_to_lines,
     build_uncertainty_raster, undo_rotation,
 )
-from skimage.morphology import opening, thin, disk
 
-# 1. Load bathymetric raster
+# 1. Load bathymetric raster (GDAL: .tif / .tiff / .bag)
 bathy_data = read_file("data/raster/H13060_MB_4m_MLLW_3of3.bag", verbose=True)
 show_depth(bathy_data, cmap='viridis')
 
@@ -74,35 +102,57 @@ bathy_binary = build_coverage_mask(bathy_data)
 bathy_lines = bathy_binary & ~opening(bathy_binary, disk(5))
 bathy_thin = thin(bathy_lines) > 0
 
-# 5. Radon transform to find dominant line orientations
-dominant = compute_dominant_angle_radon_transform(bathy_thin, circle=False)
+# 5-6. Detect dominant line orientations (Radon transform) and label each
+#      skeleton pixel with the angle family it belongs to
+orientations, angle_info = compute_local_orientation(bathy_thin, method='radon')
+# orientations = {angle: float raster (NaN where not on that family), ..., 'combined': ...}
 
-# 6. PCA-based local angle estimation
-local_orientations = compute_local_orientation(bathy_thin, line_length=50, num_neighbors=20)
-
-# 7-14. For each dominant angle: detect lines, assign depths, compute uncertainty
-for angle in dominant['peaks']:
-    # Extract pixels near this angle
-    low, high = (angle - 5) % 180, (angle + 5) % 180
-    if low < high:
-        angle_mask = (local_orientations >= low) & (local_orientations < high)
-    else:
-        angle_mask = (local_orientations >= low) | (local_orientations < high)
-
+# 7-14. For each angle family: detect lines, assign depths, compute uncertainty
+resolution = bathy_data['metadata']['resolution']
+results = {}
+for angle, family in orientations.items():
+    if angle == 'combined':
+        continue
+    # `family` is the float raster for this angle (NaN off-family);
+    # detect_trackline_positions binarises it internally
     # Detect trackline positions and assign depth values
     peaks, restored_mask, angle_to_rotate = detect_trackline_positions(
-        angle_mask, bathy_binary, angle,
+        family, bathy_binary, angle,
     )
     depth_raster = assign_depths_to_lines(
         restored_mask, bathy_binary, bathy_data, angle_to_rotate,
     )
 
-    # Compute spectral uncertainty and rotate back to original orientation
+    # Spectral uncertainty in the gaps between line pairs, rotated back
     uncertainty = build_uncertainty_raster(
-        peaks, restored_mask, depth_raster, bathy_data['metadata']['resolution'],
+        peaks, restored_mask, depth_raster, resolution, method='psd',
     )
-    result = undo_rotation(uncertainty, angle_to_rotate, bathy_binary.shape)
+    results[angle] = undo_rotation(uncertainty, angle_to_rotate, bathy_binary.shape)
 ```
+
+**Choosing methods**
+
+- `compute_local_orientation(..., method=)` accepts `'radon'` (recommended), `'pca'`
+  (needs refactoring) and `'probabilistic'`. It returns `(point_orientations, angle_info)`;
+  pass `angle_info` back in (Radon) to skip recomputing the sinogram.
+- `build_uncertainty_raster(..., method=)` accepts the spectral methods `'psd'` (default),
+  `'amplitude'`, `'psd_n'`, `'psd_lf'` and `'psd_df'`.
+
+**Estimator registry.** Estimators live in a registry in `interpolation_uncertainty.methods`:
+
+```python
+from interpolation_uncertainty.methods import list_estimators, get_estimator, register
+
+print(list_estimators())   # spectral: 'psd', 'amplitude', ...; statistical: 'SAR', 'SER', 'SMR'
+
+@register('my_method')     # or drop a .py file with this decorator into src/interpolation_uncertainty/methods/
+def my_estimator(signal, resolution, line_spacing, **kwargs):
+    ...                    # return (energy[n_segments, n_freqs], frequencies[n_freqs])
+```
+
+> **Note:** `process_line_pair` / `build_uncertainty_raster` resolve `method=` through this registry
+> and forward extra keyword arguments to the estimator (`**estimator_kwargs`). The statistical
+> estimators (`SAR`/`SER`/`SMR`) operate on 2-D input and have not been verified with the pipeline yet.
 
 ### Package structure
 
@@ -112,12 +162,22 @@ interpolation_uncertainty
 ├── visualization   — show_depth (plotting)
 ├── preprocessing
 │   ├── morphology  — build_coverage_mask, morphological filters
-│   ├── orientation — Radon transform, PCA-based local angles
-│   └── geometry    — point rotation, undo_rotation
-├── methods         — compute_uncertainty (FFT/PSD spectral energy)
-└── pipeline        — detect_trackline_positions, assign_depths_to_lines,
-                      process_line_pair, build_uncertainty_raster
+│   ├── orientation — compute_local_orientation (dispatches to orientation/ by method=)
+│   └── geometry    — rotate_points, update_geotransform, refine_cluster_rotation,
+│                     undo_rotation, x_distance
+├── orientation     — orientation_via_Radon (recommended), orientation_via_PCA,
+│                     orientation_via_Probabilistic, orientation_utils
+├── methods         — estimator registry: register, get_estimator, list_estimators
+│   ├── spectral    — spectral_estimator (FFT/PSD: amplitude, psd, psd_n, psd_lf, psd_df)
+│   └── statistical — statistical_estimator (sliding-window SAR, SER, SMR)
+└── pipeline
+    ├── tracklines  — detect_trackline_positions, assign_depths_to_lines
+    └── uncertainty — process_line_pair, build_uncertainty_raster
 ```
+
+Other top-level folders: `notebooks/` (worked examples), `tests/` (pytest suite and
+fixture), `docs/` (Sphinx / Read the Docs), `scripts/` (`sync_env_yml.py`),
+`config/` (`config.ini`) and `data/raster/` (sample surveys).
 
 ## How to cite interpolation_uncertainty
 

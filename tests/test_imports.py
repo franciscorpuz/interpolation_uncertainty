@@ -29,10 +29,11 @@ def test_subpackage_imports():
     from interpolation_uncertainty.io import read_file
     from interpolation_uncertainty.visualization import show_depth
     from interpolation_uncertainty.preprocessing import build_coverage_mask
-    from interpolation_uncertainty.methods import compute_uncertainty
+    from interpolation_uncertainty.methods import spectral_estimator, statistical_estimator
     from interpolation_uncertainty.pipeline import detect_trackline_positions
     assert callable(read_file)
     assert callable(show_depth)
     assert callable(build_coverage_mask)
-    assert callable(compute_uncertainty)
+    assert callable(spectral_estimator)
+    assert callable(statistical_estimator)
     assert callable(detect_trackline_positions)

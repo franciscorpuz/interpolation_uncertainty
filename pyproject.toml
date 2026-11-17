@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "interpolation_uncertainty"
 version = "0.0.3"
-description = "Python Codes for testing various Uncertainty Estimation methods"
+description = "Python Codes for UNCertainty EStimation Library"
 requires-python = "<3.13"
 dependencies = [
     "gdal<=3.11",
@@ -20,9 +20,9 @@ dependencies = [
     "tqdm",
 ]
 authors = [
-  {name = "Francis Corpuz", email = "francis.corpuz@noaa.gov"},
-  {name = "Glen Rice", email = "glen.rice@noaa.gov"},
-  {name = "Elias Adediran", email = "elias.adediran@unh.edu"},
+    { name = "Francis Corpuz, Elias Adediran, Glen Rice", email = "franciscorpuz@yahoo.com" },
+    { name = "Elias Adediran", email = "eliasadediran@gmail.com" },
+    { name = "Glen Rice", email = "glen.rice@noaa.gov" },
 ]
 readme = "README.md"
 license = "CC0-1.0"
@@ -37,6 +37,7 @@ classifiers = [
 
 [project.urls]
 Homepage = "https://nauticalcharts.noaa.gov/learn/nbs.html"
+Documentation = "https://interpolation_uncertainty.readthedocs.io/"
 
 [dependency-groups]
 dev = [

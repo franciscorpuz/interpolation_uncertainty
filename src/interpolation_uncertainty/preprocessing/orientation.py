@@ -44,7 +44,6 @@ def compute_local_orientation(binary_image,
 
     if method == 'pca':
         point_orientations, angle_info = orientation_via_PCA(binary_image,
-                                            angle_info=kwargs.get('angle_info', None),
                                             line_length=kwargs.get('line_length', 20),
                                             num_neighbors=kwargs.get('num_neighbors', 50))
     elif method == 'radon':
@@ -58,7 +57,6 @@ def compute_local_orientation(binary_image,
                                                              zoom_factor=kwargs.get('zoom_factor', 2.0))
     elif method == 'probabilistic':
         point_orientations, angle_info = orientation_via_Probabilistic(binary_image,
-                                                                       angle_info=kwargs.get('angle_info', None),
                                                                        test_angles=kwargs.get('test_angles', None),
                                                                        circle=kwargs.get('circle', True),
                                                                        tol=kwargs.get('tol', 5),
